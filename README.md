@@ -145,15 +145,15 @@ event includes direction, price, level, distance, relative volume, relative stre
 and the passed and missing checks. An unchanged candidate is logged at most once every five
 minutes; a changed level or confirmation set is logged immediately.
 
-Watch candidate events live in a second PowerShell window:
+Candidate events are written as readable five-line summaries to `logs/candidates.log` and printed
+in the same format in the running console. Watch them live in a second PowerShell window:
 
 ```powershell
-Get-Content .\logs\tradingpilot.log -Wait |
-  Select-String '"event": "interesting_candidate"'
+Get-Content .\logs\candidates.log -Wait
 ```
 
-The generic per-minute feature snapshots remain stored in SQLite but are no longer written at
-INFO level, keeping the operator log focused on actionable context.
+The generic per-minute feature snapshots remain stored in SQLite but are not written at INFO
+level. Candidate events are kept out of the machine-oriented JSON log, keeping both feeds focused.
 
 ## Telegram
 
