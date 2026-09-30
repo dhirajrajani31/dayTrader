@@ -2,4 +2,6 @@
 MSTR
 COIN
 PLTR
-
+AAPL
+TSLA
+MU
