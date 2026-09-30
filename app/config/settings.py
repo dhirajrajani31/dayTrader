@@ -27,6 +27,8 @@ class StrategySettings(BaseSettings):
     extension_threshold_pct: float = 0.012
     invalidation_buffer_pct: float = 0.002
     alert_cooldown_seconds: int = 300
+    candidate_log_minimum_checks: int = Field(default=3, ge=1, le=5)
+    candidate_log_cooldown_seconds: int = Field(default=300, ge=0)
     stale_after_seconds: int = 30
 
 

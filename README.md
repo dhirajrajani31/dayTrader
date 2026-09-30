@@ -136,6 +136,25 @@ Blank lines, comments beginning with `#`, and duplicates are ignored. Symbols ar
 `SPY` and `QQQ` are always included. A running process detects file changes and reconnects the
 subscription safely.
 
+## Candidate visibility
+
+Telegram is reserved for strategy state transitions such as `ARMED`, `WAITING FOR RETEST`, and
+`TRIGGERED`. The local JSON log also emits an `interesting_candidate` event before a transition
+when a symbol is near an important level and passes at least three of the five arming checks. Each
+event includes direction, price, level, distance, relative volume, relative strength, reward/risk,
+and the passed and missing checks. An unchanged candidate is logged at most once every five
+minutes; a changed level or confirmation set is logged immediately.
+
+Watch candidate events live in a second PowerShell window:
+
+```powershell
+Get-Content .\logs\tradingpilot.log -Wait |
+  Select-String '"event": "interesting_candidate"'
+```
+
+The generic per-minute feature snapshots remain stored in SQLite but are no longer written at
+INFO level, keeping the operator log focused on actionable context.
+
 ## Telegram
 
 Create a Telegram bot and put these values in `.env`:
@@ -232,8 +251,8 @@ python -m app.main market-check --stream-seconds 15
 
 In priority order:
 
-1. Run credential-backed OAuth, REST, Candle, and DXLink checks against the user's actual read-only
-   production grant, then complete multi-session reconnect/refresh soak testing.
+1. Complete multi-session reconnect/refresh soak testing against the verified read-only
+   production grant.
 2. Verify option-chain metadata plus option quote/Greeks subscriptions; then connect the existing
    selector. Until then triggered alerts explicitly say option selection is unavailable.
 3. Use the verified market-session endpoint in the runtime scheduler for holidays and half-days.

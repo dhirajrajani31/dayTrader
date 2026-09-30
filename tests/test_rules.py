@@ -1,7 +1,9 @@
 import pytest
 
+from app.config.settings import StrategySettings
 from app.strategy.engine import StrategyEngine
 from app.strategy.models import Direction, SetupState
+from app.strategy.rules import candidate_assessment
 from app.strategy.scenarios import scenario
 
 
@@ -34,3 +36,20 @@ async def test_breakout_without_retest_stays_waiting():
         await engine.evaluate(observation)
     assert next(iter(engine.machines.values())).state == SetupState.WAITING_FOR_RETEST
     assert not engine.signals
+
+
+def test_interesting_candidate_requires_near_level_and_three_checks():
+    settings = StrategySettings()
+    observation = scenario("triggered", Direction.BULLISH)[0].model_copy(
+        update={"relative_strength": None, "reward_risk": None}
+    )
+    assessment = candidate_assessment(observation, settings)
+    assert assessment.interesting
+    assert assessment.score == 3
+    assert "important level approached" in assessment.passed
+    assert "directional relative strength" in assessment.missing
+
+    far_from_level = observation.model_copy(update={"price": 105.0, "reward_risk": 2.0})
+    far_assessment = candidate_assessment(far_from_level, settings)
+    assert far_assessment.score >= 3
+    assert not far_assessment.interesting

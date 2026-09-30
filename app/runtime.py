@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Awaitable, Callable, Sequence
-from datetime import datetime
+from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
 from app.config.settings import StrategySettings
@@ -11,7 +11,8 @@ from app.market_data.models import CandleEvent, QuoteEvent, TradeEvent
 from app.strategy.engine import StrategyEngine
 from app.strategy.features import build_feature_snapshot, momentum, relative_strength, vwap
 from app.strategy.levels import nearest_levels, reference_levels, swing_levels
-from app.strategy.models import Direction, Level, StrategyObservation
+from app.strategy.models import Direction, Level, SetupState, StrategyObservation
+from app.strategy.rules import candidate_assessment
 
 
 class CandleBuilder:
@@ -102,7 +103,7 @@ class MarketMonitor:
                         self.quotes.get(event.symbol),
                         stale_after_seconds=self.stale_after_seconds,
                     )
-                    self.log.info(
+                    self.log.debug(
                         "feature_snapshot",
                         extra={"event": "feature_snapshot", "symbol": event.symbol},
                     )
@@ -121,6 +122,10 @@ class LiveStrategyCoordinator:
         self.engine = engine
         self.settings = settings
         self.history: dict[str, list[CandleEvent]] = {}
+        self.log = logging.getLogger("tradingpilot.strategy.candidates")
+        self._candidate_log_state: dict[
+            tuple[str, Direction], tuple[datetime, tuple[object, ...]]
+        ] = {}
 
     async def evaluate(self, symbol: str, candles: Sequence[CandleEvent]) -> None:
         self.history[symbol] = list(candles)
@@ -273,7 +278,52 @@ class LiveStrategyCoordinator:
                 reward_risk=reward_risk,
                 next_level=next_level,
             )
+            self._log_interesting_candidate(observation)
             await self.engine.evaluate(observation)
+
+    def _log_interesting_candidate(self, observation: StrategyObservation) -> None:
+        machine = self.engine.machines.get((observation.symbol, observation.direction))
+        if machine is not None and machine.state != SetupState.WATCHING:
+            return
+        key = (observation.symbol, observation.direction)
+        assessment = candidate_assessment(observation, self.settings)
+        if not assessment.interesting or observation.level is None:
+            self._candidate_log_state.pop(key, None)
+            return
+        signature: tuple[object, ...] = (
+            observation.level.type,
+            round(observation.level.midpoint, 4),
+            assessment.passed,
+        )
+        previous = self._candidate_log_state.get(key)
+        cooldown = timedelta(seconds=self.settings.candidate_log_cooldown_seconds)
+        if previous:
+            previous_time, previous_signature = previous
+            if signature == previous_signature and observation.timestamp - previous_time < cooldown:
+                return
+        distance_pct = abs(observation.price - observation.level.midpoint) / (
+            observation.level.midpoint
+        )
+        self.log.info(
+            "interesting_candidate",
+            extra={
+                "event": "interesting_candidate",
+                "symbol": observation.symbol,
+                "direction": observation.direction.value,
+                "price": round(observation.price, 4),
+                "level_type": observation.level.type,
+                "level_price": round(observation.level.midpoint, 4),
+                "distance_pct": round(distance_pct, 6),
+                "relative_volume": observation.relative_volume,
+                "relative_strength": observation.relative_strength,
+                "reward_risk": observation.reward_risk,
+                "check_score": assessment.score,
+                "check_total": assessment.total,
+                "passed_checks": assessment.passed,
+                "missing_checks": assessment.missing,
+            },
+        )
+        self._candidate_log_state[key] = (observation.timestamp, signature)
 
     @staticmethod
     def _next_level(current: float, direction: Direction, levels: Sequence[Level]) -> float | None:

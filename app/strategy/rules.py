@@ -12,9 +12,24 @@ class RuleResult:
     reasons: tuple[str, ...]
 
 
-def arm_check(obs: StrategyObservation, cfg: StrategySettings) -> RuleResult:
+@dataclass(frozen=True)
+class CandidateAssessment:
+    interesting: bool
+    score: int
+    total: int
+    passed: tuple[str, ...]
+    missing: tuple[str, ...]
+
+
+def arm_conditions(obs: StrategyObservation, cfg: StrategySettings) -> dict[str, bool]:
     if obs.level is None:
-        return RuleResult(False, ("no meaningful technical level",))
+        return {
+            "important level approached": False,
+            "abnormal activity": False,
+            "directional relative strength": False,
+            "VWAP/opening-range context": False,
+            "adequate room": False,
+        }
     level = obs.level.midpoint
     near = abs(obs.price - level) / level <= cfg.approach_distance_pct
     activity = (
@@ -30,13 +45,33 @@ def arm_check(obs: StrategyObservation, cfg: StrategySettings) -> RuleResult:
     )
     context = vwap_context or obs.opening_range_context
     room = obs.reward_risk is not None and obs.reward_risk >= cfg.minimum_reward_risk
-    checks = {
+    return {
         "important level approached": near,
         "abnormal activity": activity,
         "directional relative strength": directional_rs,
         "VWAP/opening-range context": context,
         "adequate room": room,
     }
+
+
+def candidate_assessment(obs: StrategyObservation, cfg: StrategySettings) -> CandidateAssessment:
+    checks = arm_conditions(obs, cfg)
+    passed = tuple(name for name, result in checks.items() if result)
+    missing = tuple(name for name, result in checks.items() if not result)
+    near_level = checks["important level approached"]
+    return CandidateAssessment(
+        interesting=near_level and len(passed) >= cfg.candidate_log_minimum_checks,
+        score=len(passed),
+        total=len(checks),
+        passed=passed,
+        missing=missing,
+    )
+
+
+def arm_check(obs: StrategyObservation, cfg: StrategySettings) -> RuleResult:
+    if obs.level is None:
+        return RuleResult(False, ("no meaningful technical level",))
+    checks = arm_conditions(obs, cfg)
     return RuleResult(
         all(checks.values()), tuple(name for name, passed in checks.items() if passed)
     )
