@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Awaitable, Callable, Sequence
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from zoneinfo import ZoneInfo
 
 from app.config.settings import StrategySettings
@@ -126,6 +126,7 @@ class LiveStrategyCoordinator:
         self._candidate_log_state: dict[
             tuple[str, Direction], tuple[datetime, tuple[object, ...]]
         ] = {}
+        self._session_dates: dict[str, date] = {}
 
     async def evaluate(self, symbol: str, candles: Sequence[CandleEvent]) -> None:
         self.history[symbol] = list(candles)
@@ -134,6 +135,12 @@ class LiveStrategyCoordinator:
         last = candles[-1]
         chicago = ZoneInfo("America/Chicago")
         session_date = last.timestamp.astimezone(chicago).date()
+        previous_session = self._session_dates.get(symbol)
+        if previous_session is not None and previous_session != session_date:
+            for direction in Direction:
+                self.engine.machines.pop((symbol, direction), None)
+                self._candidate_log_state.pop((symbol, direction), None)
+        self._session_dates[symbol] = session_date
         today = [
             candle
             for candle in candles

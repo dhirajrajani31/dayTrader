@@ -28,6 +28,16 @@ def test_refresh_credentials_satisfy_runtime_configuration():
     assert settings.has_tastytrade_credentials
 
 
+def test_option_policy_can_be_configured_from_environment(monkeypatch):
+    monkeypatch.setenv("OPTION_MIN_DAYS_TO_EXPIRATION", "2")
+    monkeypatch.setenv("OPTION_MAXIMUM_SPREAD_PCT", "0.15")
+
+    settings = Settings()
+
+    assert settings.options.min_days_to_expiration == 2
+    assert settings.options.maximum_spread_pct == 0.15
+
+
 def test_all_required_sqlite_tables_initialize(tmp_path):
     engine, _ = create_database(f"sqlite:///{tmp_path / 'pilot.db'}")
     names = set(inspect(engine).get_table_names())
@@ -40,6 +50,8 @@ def test_all_required_sqlite_tables_initialize(tmp_path):
         "signals",
         "shadow_trades",
         "shadow_trade_outcomes",
+        "shadow_option_trades",
+        "shadow_option_marks",
         "application_events",
     } <= names
 

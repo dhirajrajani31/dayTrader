@@ -5,12 +5,13 @@ import json
 import logging
 import math
 from collections.abc import AsyncIterator, Sequence
-from datetime import UTC, datetime
+from datetime import UTC, datetime, time
 from typing import Any
 
 import httpx
 import websockets
 
+from app.config.settings import OptionSettings
 from app.market_data.auth import OAuthTokenManager
 from app.market_data.base import MarketDataError, MarketDataProvider
 from app.market_data.models import (
@@ -26,12 +27,16 @@ from app.market_data.models import (
 class TastytradeMarketDataProvider(MarketDataProvider):
     """Read-only adapter for tastytrade's documented REST and DXLink interfaces.
 
-    It deliberately exposes no account/order client. Option-chain normalization remains isolated
-    until its schemas are verified with credentials; unavailable data is returned as an empty
-    sequence.
+    It deliberately exposes no account/order client. Equity option discovery and metrics use only
+    the documented read-only nested-chain, REST market-data, and DXLink feed interfaces.
     """
 
-    def __init__(self, auth: OAuthTokenManager | str, stale_after_seconds: int = 30):
+    def __init__(
+        self,
+        auth: OAuthTokenManager | str,
+        stale_after_seconds: int = 30,
+        option_settings: OptionSettings | None = None,
+    ):
         self.auth = (
             auth
             if isinstance(auth, OAuthTokenManager)
@@ -40,6 +45,7 @@ class TastytradeMarketDataProvider(MarketDataProvider):
         if not self.auth.configured:
             raise ValueError("tastytrade OAuth credentials are required")
         self.stale_after_seconds = stale_after_seconds
+        self.option_settings = option_settings or OptionSettings()
         self.connection_state = ConnectionState.DISCONNECTED
         self._quotes: dict[str, QuoteEvent] = {}
         self._candles: dict[str, list[CandleEvent]] = {}
@@ -166,11 +172,242 @@ class TastytradeMarketDataProvider(MarketDataProvider):
         return normalized
 
     async def get_option_chain(self, symbol: str) -> Sequence[OptionQuote]:
-        self.log.warning(
-            "option_chain_unavailable",
-            extra={"event": "option_chain_unavailable", "symbol": symbol.upper()},
-        )
-        return []
+        symbol = symbol.upper()
+        try:
+            response = await self.auth.request("GET", f"/option-chains/{symbol}/nested")
+            chains = response.json().get("data", {}).get("items", [])
+            underlying_quote = self._quotes.get(symbol) or await self.get_quote(symbol)
+            reference = None
+            if underlying_quote is not None:
+                reference = underlying_quote.last
+                if (
+                    reference is None
+                    and underlying_quote.bid is not None
+                    and underlying_quote.ask is not None
+                ):
+                    reference = (underlying_quote.bid + underlying_quote.ask) / 2
+            if reference is None:
+                raise MarketDataError(f"underlying quote unavailable for option chain {symbol}")
+            candidates = self._option_contracts(chains, symbol, reference)
+            if not candidates:
+                return []
+            return await self._option_snapshots(candidates)
+        except MarketDataError:
+            raise
+        except (httpx.HTTPError, KeyError, TypeError, ValueError) as exc:
+            raise MarketDataError(f"option chain request failed for {symbol}: {exc}") from exc
+
+    def _option_contracts(
+        self, chains: Any, symbol: str, underlying_price: float
+    ) -> list[OptionQuote]:
+        if not isinstance(chains, list):
+            return []
+        expirations: list[tuple[dict[str, Any], int, int]] = []
+        for chain_index, chain in enumerate(chains):
+            if not isinstance(chain, dict):
+                continue
+            if str(chain.get("option-chain-type", "Standard")).lower() != "standard":
+                continue
+            shares = int(chain.get("shares-per-contract") or 100)
+            if shares != 100:
+                continue
+            for expiration in chain.get("expirations", []):
+                if not isinstance(expiration, dict):
+                    continue
+                dte = int(expiration.get("days-to-expiration") or 0)
+                if (
+                    self.option_settings.min_days_to_expiration
+                    <= dte
+                    <= self.option_settings.max_days_to_expiration
+                ):
+                    expirations.append((expiration, dte, chain_index))
+        if not expirations:
+            return []
+        selected_dte = min(item[1] for item in expirations)
+        selected = [item for item in expirations if item[1] == selected_dte]
+        contracts: list[OptionQuote] = []
+        for expiration, dte, chain_index in selected:
+            raw_date = str(expiration["expiration-date"])
+            expiration_at = datetime.combine(
+                datetime.fromisoformat(raw_date).date(), time(20, 0), tzinfo=UTC
+            )
+            strikes = [item for item in expiration.get("strikes", []) if isinstance(item, dict)]
+            nearest = sorted(
+                strikes,
+                key=lambda item: abs(float(item.get("strike-price") or 0) - underlying_price),
+            )[: self.option_settings.maximum_chain_strikes]
+            shares = int(chains[chain_index].get("shares-per-contract") or 100)
+            for strike in nearest:
+                strike_price = float(strike["strike-price"])
+                for call_put, key in (("CALL", "call"), ("PUT", "put")):
+                    option_symbol = strike.get(key)
+                    streamer_symbol = strike.get(f"{key}-streamer-symbol")
+                    if not option_symbol or not streamer_symbol:
+                        continue
+                    contracts.append(
+                        OptionQuote(
+                            symbol=str(option_symbol),
+                            streamer_symbol=str(streamer_symbol),
+                            underlying_symbol=symbol,
+                            expiration=expiration_at,
+                            days_to_expiration=dte,
+                            strike=strike_price,
+                            call_put=call_put,
+                            shares_per_contract=shares,
+                        )
+                    )
+        return contracts
+
+    async def _option_snapshots(self, candidates: Sequence[OptionQuote]) -> list[OptionQuote]:
+        by_streamer = {item.streamer_symbol: item for item in candidates}
+        values = {symbol: item.model_dump() for symbol, item in by_streamer.items()}
+        url, token = await self._stream_credentials()
+        received = False
+        try:
+            async with websockets.connect(url, ping_interval=None, close_timeout=5) as socket:
+                await self._send_setup(
+                    socket,
+                    token,
+                    {
+                        "Quote": [
+                            "eventType",
+                            "eventSymbol",
+                            "bidPrice",
+                            "askPrice",
+                            "bidSize",
+                            "askSize",
+                        ],
+                        "Trade": ["eventType", "eventSymbol", "price", "dayVolume", "size"],
+                        "Greeks": [
+                            "eventType",
+                            "eventSymbol",
+                            "volatility",
+                            "delta",
+                            "gamma",
+                            "theta",
+                            "rho",
+                            "vega",
+                        ],
+                        "Summary": [
+                            "eventType",
+                            "eventSymbol",
+                            "openInterest",
+                            "dayOpenPrice",
+                            "dayHighPrice",
+                            "dayLowPrice",
+                            "prevDayClosePrice",
+                        ],
+                    },
+                )
+                add = [
+                    {"type": event_type, "symbol": item.streamer_symbol}
+                    for item in candidates
+                    for event_type in ("Quote", "Trade", "Greeks", "Summary")
+                ]
+                await socket.send(
+                    json.dumps(
+                        {"type": "FEED_SUBSCRIPTION", "channel": 3, "reset": True, "add": add}
+                    )
+                )
+                deadline = asyncio.get_running_loop().time() + 6
+                quiet_intervals = 0
+                while asyncio.get_running_loop().time() < deadline:
+                    remaining = deadline - asyncio.get_running_loop().time()
+                    try:
+                        message = await asyncio.wait_for(
+                            socket.recv(), timeout=min(0.75, remaining)
+                        )
+                    except TimeoutError:
+                        quiet_intervals += 1
+                        if received and quiet_intervals >= 2:
+                            break
+                        continue
+                    quiet_intervals = 0
+                    received |= self._merge_option_message(message, values)
+        except (OSError, websockets.WebSocketException, json.JSONDecodeError) as exc:
+            self.log.warning(
+                "option_dxlink_snapshot_failed",
+                extra={"event": "option_dxlink_snapshot_failed", "state": type(exc).__name__},
+            )
+        enriched = [OptionQuote.model_validate(item) for item in values.values()]
+        if any(item.bid is None or item.ask is None for item in enriched):
+            enriched = await self._merge_rest_option_quotes(enriched)
+        return enriched
+
+    def _merge_option_message(
+        self, message: str | bytes, values: dict[str, dict[str, Any]]
+    ) -> bool:
+        raw = json.loads(message)
+        if raw.get("type") != "FEED_DATA":
+            return False
+        data = raw.get("data", [])
+        event_type = str(data[0]) if data else ""
+        widths = {"Quote": 6, "Trade": 5, "Greeks": 8, "Summary": 7}
+        width = widths.get(event_type, 0)
+        changed = False
+        for row in _compact_rows(data, width):
+            target = values.get(str(row[1]))
+            if target is None:
+                continue
+            target["timestamp"] = datetime.now(UTC)
+            if event_type == "Quote":
+                target["bid"] = _finite_float(row[2])
+                target["ask"] = _finite_float(row[3])
+            elif event_type == "Trade":
+                volume = _finite_float(row[3])
+                target["volume"] = int(volume) if volume is not None else None
+            elif event_type == "Greeks":
+                target["iv"] = _finite_float(row[2])
+                target["delta"] = _finite_float(row[3])
+                target["gamma"] = _finite_float(row[4])
+                target["theta"] = _finite_float(row[5])
+            elif event_type == "Summary":
+                open_interest = _finite_float(row[2])
+                target["open_interest"] = int(open_interest) if open_interest is not None else None
+            changed = True
+        return changed
+
+    async def _merge_rest_option_quotes(
+        self, candidates: Sequence[OptionQuote]
+    ) -> list[OptionQuote]:
+        if not candidates:
+            return []
+        params = {"equity-option": ",".join(item.symbol for item in candidates)}
+        response = await self.auth.request("GET", "/market-data/by-type", params=params)
+        items = response.json().get("data", {}).get("items", [])
+        by_symbol = {item.symbol: item for item in candidates}
+        for raw in items:
+            candidate = by_symbol.get(str(raw.get("symbol")))
+            if candidate is None:
+                continue
+            timestamp = _parse_timestamp(raw.get("updated-at"))
+            by_symbol[candidate.symbol] = candidate.model_copy(
+                update={
+                    "timestamp": timestamp,
+                    "bid": _finite_float(raw.get("bid")),
+                    "ask": _finite_float(raw.get("ask")),
+                }
+            )
+        return list(by_symbol.values())
+
+    async def get_option_quote(self, symbol: str) -> QuoteEvent | None:
+        try:
+            response = await self.auth.request(
+                "GET", "/market-data/by-type", params={"equity-option": symbol}
+            )
+            items = response.json().get("data", {}).get("items", [])
+            if not items:
+                return None
+            raw = items[0]
+            return QuoteEvent(
+                symbol=symbol,
+                timestamp=_parse_timestamp(raw.get("updated-at")) or datetime.now(UTC),
+                bid=_finite_float(raw.get("bid")),
+                ask=_finite_float(raw.get("ask")),
+                last=_finite_float(raw.get("last")),
+            )
+        except (httpx.HTTPError, KeyError, TypeError, ValueError) as exc:
+            raise MarketDataError(f"option quote request failed for {symbol}: {exc}") from exc
 
     async def _stream_credentials(self) -> tuple[str, str]:
         response = await self.auth.request("GET", "/api-quote-tokens")
@@ -469,6 +706,15 @@ def _float_or_none(value: Any) -> float | None:
 def _finite_float(value: Any) -> float | None:
     number = _float_or_none(value)
     return number if number is not None and math.isfinite(number) else None
+
+
+def _parse_timestamp(value: Any) -> datetime | None:
+    if not isinstance(value, str) or not value:
+        return None
+    try:
+        return datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
 
 
 def _compact_rows(data: Any, width: int) -> list[list[Any]]:

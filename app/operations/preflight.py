@@ -10,7 +10,10 @@ import httpx
 from app.config.settings import Settings
 from app.market_data.auth import token_manager_from_settings
 from app.market_data.tastytrade import TastytradeMarketDataProvider
+from app.options.models import OptionCandidate
+from app.options.selector import select_option
 from app.storage.repository import Repository
+from app.strategy.models import Direction
 from app.watchlist.manager import WatchlistManager
 
 
@@ -67,7 +70,9 @@ async def run_market_check(
         return results
 
     auth = token_manager_from_settings(settings)
-    provider = TastytradeMarketDataProvider(auth, settings.strategy.stale_after_seconds)
+    provider = TastytradeMarketDataProvider(
+        auth, settings.strategy.stale_after_seconds, settings.options
+    )
     try:
         await auth.get_access_token()
         mode = "refresh-token flow" if auth.can_refresh else "static access-token fallback"
@@ -84,15 +89,63 @@ async def run_market_check(
     except Exception as exc:
         results.append(CheckResult("market calendar", CheckStatus.FAIL, str(exc)))
 
+    spy_price: float | None = None
     try:
         quote = await provider.get_quote("SPY")
         if quote and quote.last is not None:
+            spy_price = quote.last
             detail = f"SPY last={quote.last:.2f} as-of={quote.timestamp.isoformat()}"
             results.append(CheckResult("REST quote", CheckStatus.PASS, detail))
         else:
             results.append(CheckResult("REST quote", CheckStatus.FAIL, "SPY quote unavailable"))
     except Exception as exc:
         results.append(CheckResult("REST quote", CheckStatus.FAIL, str(exc)))
+
+    try:
+        chain = await provider.get_option_chain("SPY")
+        complete = [
+            item
+            for item in chain
+            if item.bid is not None and item.ask is not None and item.delta is not None
+        ]
+        candidates = [
+            OptionCandidate(
+                **item.model_dump(exclude={"timestamp"}),
+                quote_timestamp=item.timestamp,
+            )
+            for item in complete
+        ]
+        selected_call = (
+            select_option(candidates, spy_price, Direction.BULLISH, settings.options)
+            if spy_price is not None
+            else None
+        )
+        selected_put = (
+            select_option(candidates, spy_price, Direction.BEARISH, settings.options)
+            if spy_price is not None
+            else None
+        )
+        if selected_call and selected_put:
+            results.append(
+                CheckResult(
+                    "option data",
+                    CheckStatus.PASS,
+                    (
+                        f"{len(complete)} contracts enriched; selector chose "
+                        f"{selected_call.symbol} and {selected_put.symbol}"
+                    ),
+                )
+            )
+        else:
+            results.append(
+                CheckResult(
+                    "option data",
+                    CheckStatus.FAIL,
+                    "could not select both a call and put under configured DTE/delta/spread rules",
+                )
+            )
+    except Exception as exc:
+        results.append(CheckResult("option data", CheckStatus.FAIL, str(exc)))
 
     try:
         history = await provider.warm_up(

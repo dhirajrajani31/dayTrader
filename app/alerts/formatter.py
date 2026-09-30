@@ -2,6 +2,14 @@ from app.options.models import OptionCandidate
 from app.strategy.models import Direction, SetupState, StateTransition
 
 
+def _metric(value: float | None, digits: int = 3) -> str:
+    return "n/a" if value is None else f"{value:.{digits}f}"
+
+
+def _percent(value: float | None) -> str:
+    return "n/a" if value is None else f"{value:.1%}"
+
+
 def format_transition(transition: StateTransition, option: OptionCandidate | None = None) -> str:
     obs = transition.observation
     icons = {
@@ -29,14 +37,33 @@ def format_transition(transition: StateTransition, option: OptionCandidate | Non
         )
         lines.extend(["", f"Waiting for: {action}", "DO NOT ENTER YET"])
     elif transition.to_state == SetupState.TRIGGERED:
-        lines.extend(
-            [
-                "",
-                f"Option: {option.symbol}" if option else "Option selection unavailable",
-                "",
-                "SHADOW MODE — NO ORDER SENT",
-            ]
-        )
+        lines.append("")
+        if option:
+            lines.extend(
+                [
+                    f"Option shadow: {option.symbol}",
+                    (
+                        f"{option.expiration.date().isoformat()} | ${option.strike:g} "
+                        f"{option.call_put.upper()} | {option.days_to_expiration} DTE"
+                    ),
+                    (
+                        f"Bid/ask: ${option.bid:.2f} / ${option.ask:.2f} | "
+                        f"simulated buy: ${option.simulated_entry_fill:.2f}"
+                    ),
+                    (
+                        f"Delta: {_metric(option.delta)} | Gamma: {_metric(option.gamma)} | "
+                        f"Theta: {_metric(option.theta)} | "
+                        f"IV: {_percent(option.iv)}"
+                    ),
+                    (
+                        f"Spread: {option.spread_pct:.1%} | OI: {option.open_interest or 0:,} | "
+                        f"Volume: {option.volume or 0:,}"
+                    ),
+                ]
+            )
+        else:
+            lines.append("Option selection unavailable")
+        lines.extend(["", "SHADOW MODE — NO ORDER SENT"])
     elif transition.to_state == SetupState.EXTENDED:
         lines.extend(["", "DO NOT CHASE."])
     return "\n".join(lines)

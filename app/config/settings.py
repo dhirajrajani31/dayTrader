@@ -12,7 +12,12 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 class StrategySettings(BaseSettings):
     """Versioned rule thresholds. Values are intentionally configurable, not optimized."""
 
-    model_config = SettingsConfigDict(env_prefix="STRATEGY_", extra="ignore")
+    model_config = SettingsConfigDict(
+        env_prefix="STRATEGY_",
+        env_file=".env",
+        env_file_encoding="utf-8",
+        extra="ignore",
+    )
 
     name: str = "MR_INVESTR_BASELINE"
     version: str = "0.1.0"
@@ -30,6 +35,45 @@ class StrategySettings(BaseSettings):
     candidate_log_minimum_checks: int = Field(default=3, ge=1, le=5)
     candidate_log_cooldown_seconds: int = Field(default=300, ge=0)
     stale_after_seconds: int = 30
+
+
+class OptionSettings(BaseSettings):
+    """Conservative, deterministic assumptions for one-contract shadow option trades."""
+
+    model_config = SettingsConfigDict(
+        env_prefix="OPTION_",
+        env_file=".env",
+        env_file_encoding="utf-8",
+        extra="ignore",
+    )
+
+    execution_policy_version: str = "OPTION_SHADOW_V1"
+    min_days_to_expiration: int = Field(default=1, ge=0)
+    max_days_to_expiration: int = Field(default=7, ge=1)
+    maximum_chain_strikes: int = Field(default=20, ge=4, le=50)
+    minimum_abs_delta: float = Field(default=0.55, ge=0, le=1)
+    maximum_abs_delta: float = Field(default=0.70, ge=0, le=1)
+    target_abs_delta: float = Field(default=0.625, ge=0, le=1)
+    maximum_spread_pct: float = Field(default=0.20, gt=0, le=1)
+    quantity: int = Field(default=1, ge=1)
+    contract_multiplier: int = Field(default=100, ge=1)
+    maximum_holding_minutes: int = Field(default=60, ge=5)
+
+    @field_validator("maximum_abs_delta")
+    @classmethod
+    def maximum_delta_not_below_minimum(cls, value: float, info) -> float:
+        minimum = info.data.get("minimum_abs_delta")
+        if minimum is not None and value < minimum:
+            raise ValueError("maximum_abs_delta must be at least minimum_abs_delta")
+        return value
+
+    @field_validator("max_days_to_expiration")
+    @classmethod
+    def maximum_dte_not_below_minimum(cls, value: int, info) -> int:
+        minimum = info.data.get("min_days_to_expiration")
+        if minimum is not None and value < minimum:
+            raise ValueError("max_days_to_expiration must be at least min_days_to_expiration")
+        return value
 
 
 class Settings(BaseSettings):
@@ -54,6 +98,7 @@ class Settings(BaseSettings):
     historical_warmup_timeout_seconds: float = 20
     benchmarks: tuple[str, ...] = ("SPY", "QQQ")
     strategy: StrategySettings = Field(default_factory=StrategySettings)
+    options: OptionSettings = Field(default_factory=OptionSettings)
 
     @field_validator("trading_mode", mode="before")
     @classmethod

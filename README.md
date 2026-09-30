@@ -11,10 +11,10 @@ that identity so later rule versions can coexist.
 ## Safety boundary
 
 `TRADING_MODE=SHADOW` is validated at configuration startup. Any other value aborts the program.
-The tastytrade adapter implements the read-only market-data interface only: quote lookup, DXLink
-quote/trade streaming, and DXLink historical one-minute candles. Option data remains an isolated
-placeholder until verified. There is no order model, order endpoint, dry-run order endpoint, or
-execution module.
+The tastytrade adapter implements read-only market data only: quotes, DXLink quote/trade
+streaming, historical one-minute candles, nested option chains, and option Quote/Trade/Greeks/
+Summary data. There is no order model, order endpoint, dry-run order endpoint, or live execution
+module. An "option trade" always means a local simulated fill in SQLite.
 
 ## Architecture and data flow
 
@@ -39,19 +39,22 @@ WATCHING -> ARMED -> WAITING_FOR_RETEST
                          v       v       v
                     TRIGGERED INVALIDATED EXTENDED
                          |
-              +----------+----------+
-              |                     |
-       console/Telegram       SQLite ShadowTrade
-                                   + outcomes
+              +----------+----------------+
+              |                           |
+       console/Telegram        listed option selection
+                                   |
+                         ask entry -> bid marks/exit
+                                   |
+                      SQLite underlying + option P&L
 ```
 
 The packages are separated by responsibility:
 
 - `app/market_data`: provider contract, normalized events, synthetic provider, tastytrade adapter;
 - `app/strategy`: features, level zones, rules, explicit state machine, engine and replay scenarios;
-- `app/options`: hypothetical option candidate model and liquidity/delta selector;
+- `app/options`: listed-contract model and deterministic liquidity/delta selector;
 - `app/alerts`: formatting, console delivery, Telegram cooldown/deduplication;
-- `app/shadow`: in-memory MFE/MAE, checkpoints, targets and stop tracking;
+- `app/shadow`: candle-range MFE/MAE plus conservative option fill/P&L tracking;
 - `app/storage`: SQLAlchemy schema and SQLite repository;
 - `app/watchlist`: normalized file/CLI watchlist with automatic SPY and QQQ;
 - `app/market_context`: benchmark context and the deliberately unavailable sector extension point.
@@ -201,6 +204,12 @@ It uses the documented production REST base URL, required `User-Agent`,
 [market-data guide](https://developer.tastytrade.com/docs/concepts/market-data/), and
 [OAuth guide](https://developer.tastytrade.com/oauth/).
 
+Option selection uses the official
+[nested option-chain endpoint](https://developer.tastytrade.com/reference/instruments/getOptionChainsSymbolNested/),
+the broker-provided OCC and streamer symbols, the
+[market-data endpoint](https://developer.tastytrade.com/reference/market-data/getMarketDataByType/),
+and DXLink Quote, Trade, Greeks, and Summary events. Contract symbols are never synthesized.
+
 TradingPilot automatically exchanges the long-lived refresh token for a 15-minute access token,
 caches it, refreshes one minute before expiry, and retries one authenticated request after a `401`.
 Refreshing is concurrency-safe, and secrets/tokens are never logged. A manually supplied
@@ -214,17 +223,40 @@ the strategy never invents them.
 
 `market-check` verifies SHADOW mode, SQLite, the watchlist, OAuth minting, the official equity
 market-session endpoint, an SPY REST quote, historical SPY candles, and a live SPY/QQQ DXLink
-event. Telegram is validated when configured; add `--send-telegram` to send an explicit test
-message. A quiet/closed live stream is reported as a warning, while authentication, REST, or
-historical failures make the command exit nonzero.
+event. It also downloads the official nested SPY option chain, enriches contracts with quote and
+Greeks data, and requires the configured selector to choose both a call and a put. Telegram is
+validated when configured; add `--send-telegram` to send an explicit test message. A quiet/closed
+live stream is reported as a warning, while authentication, REST, option, or historical failures
+make the command exit nonzero.
 
 ## Shadow trades and persistence
 
 On `TRIGGERED`, the program stores the underlying entry, direction, version, invalidation, targets,
-full entry observation and benchmark-related inputs. Completed candles update 5/15/30/60-minute
-checkpoints, maximum favorable/adverse excursion, stop/target flags, target times and estimated R.
-Outcomes are snapshots, not orders. SQLite stores normalized feature snapshots and transition
-contexts, not every raw market tick.
+full entry observation and benchmark-related inputs. It then requests the listed option chain and
+selects a call for bullish signals or a put for bearish signals. The default policy uses 1-7 DTE,
+0.55-0.70 absolute delta, no more than a 20% quoted spread, and one contract. It records bid/ask,
+delta, gamma, theta, IV, open interest, and volume at entry.
+
+The simulated entry is the displayed ask. Every completed one-minute candle marks liquidation at
+the displayed bid, so spread cost is included rather than assuming midpoint fills. The position
+closes at bid when the underlying reaches target 1, breaches invalidation, or reaches the 60-minute
+time limit. If target and stop occur in the same one-minute candle, the conservative stop outcome
+wins. This is execution policy `OPTION_SHADOW_V1`; changing assumptions requires a new version.
+
+Underlying MFE/MAE, target, and stop detection use each completed candle's high and low—not only
+its close—fixing the prior intraminute blind spot. Exact ordering inside a one-minute candle is not
+available. A restart restores today's state machines and open underlying/option shadow trades from
+SQLite. It cannot reconstruct market movement that occurred while the program was stopped.
+
+Inspect recent trades at any time:
+
+```powershell
+python -m app.main trades --limit 10
+```
+
+The report shows the underlying setup and outcome, exact OCC contract, entry Greeks and
+liquidity, conservative liquidation value, unrealized/realized P&L, and exit reason. These are
+simulations and never brokerage orders.
 
 Tables are:
 
@@ -235,6 +267,8 @@ Tables are:
 - `signals`
 - `shadow_trades`
 - `shadow_trade_outcomes`
+- `shadow_option_trades`
+- `shadow_option_marks`
 - `application_events`
 
 ## Validation
@@ -251,17 +285,16 @@ python -m app.main market-check --stream-seconds 15
 
 In priority order:
 
-1. Complete multi-session reconnect/refresh soak testing against the verified read-only
+1. Accumulate a statistically meaningful sample across different market regimes; compare win
+   rate, expected value, drawdown, setup features, entry timing, spread, Greeks, and time of day.
+2. Complete multi-session reconnect/refresh soak testing against the verified read-only
    production grant.
-2. Verify option-chain metadata plus option quote/Greeks subscriptions; then connect the existing
-   selector. Until then triggered alerts explicitly say option selection is unavailable.
 3. Use the verified market-session endpoint in the runtime scheduler for holidays and half-days.
    The current session helper handles
    weekdays, Chicago time, and DST but not exchange holidays.
-4. Add durable recovery for in-flight state machines and active shadow trades after a restart.
-5. Replace per-candle outcome snapshot inserts with update/compaction for longer pilot runs.
-6. Add retention policy, database migrations, and more detailed feed-health metrics.
-7. Add verified sector ETF context; no sector mapping is guessed in this version.
+4. Add database migrations, retention, and outcome compaction for longer pilot runs.
+5. Add more detailed feed-health metrics.
+6. Add verified sector ETF context; no sector mapping is guessed in this version.
 
 Do not treat the current thresholds or synthetic results as evidence of profitability. Run shadow
 mode through varied market regimes and analyze versioned outcomes before changing rules.

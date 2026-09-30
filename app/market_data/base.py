@@ -25,6 +25,10 @@ class MarketDataProvider(ABC):
     @abstractmethod
     async def get_option_chain(self, symbol: str) -> Sequence[OptionQuote]: ...
 
+    async def get_option_quote(self, symbol: str) -> QuoteEvent | None:
+        """Return a current option quote when supported by the provider."""
+        return None
+
     async def warm_up(
         self,
         symbols: Sequence[str],

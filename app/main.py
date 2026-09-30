@@ -4,7 +4,7 @@ import argparse
 import asyncio
 import json
 import logging
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, time, timedelta
 
 from app.alerts.telegram import AlertDispatcher
 from app.config.settings import Settings
@@ -12,8 +12,12 @@ from app.logging_config import configure_logging
 from app.market_data.auth import token_manager_from_settings
 from app.market_data.tastytrade import TastytradeMarketDataProvider
 from app.operations.preflight import CheckStatus, print_results, run_market_check
+from app.options.models import OptionCandidate
+from app.options.selector import select_option
 from app.runtime import LiveStrategyCoordinator, MarketMonitor
+from app.shadow.option_tracker import OptionShadowTracker
 from app.shadow.outcome_engine import outcome_summary
+from app.shadow.report import format_trade_report
 from app.shadow.tracker import ShadowTracker
 from app.storage.database import create_database
 from app.storage.repository import Repository
@@ -38,6 +42,8 @@ def parser() -> argparse.ArgumentParser:
     watchlist = commands.add_parser("watchlist", help="replace today's watchlist")
     watchlist.add_argument("symbols", nargs="+")
     commands.add_parser("status", help="print persisted local status")
+    trades = commands.add_parser("trades", help="print recent shadow trade outcomes")
+    trades.add_argument("--limit", type=int, default=20)
     commands.add_parser("init-db", help="initialize the SQLite schema")
     return root
 
@@ -103,11 +109,15 @@ async def run_live(settings: Settings, repository: Repository, manager: Watchlis
         settings.strategy.alert_cooldown_seconds,
     )
     tracker = ShadowTracker()
+    option_tracker = OptionShadowTracker(settings.options)
     trade_ids: dict[str, int] = {}
     last_health_recorded: datetime | None = None
 
+    provider: TastytradeMarketDataProvider | None = None
+
     async def transition_handler(transition: StateTransition) -> None:
         repository.save_transition(transition)
+        option: OptionCandidate | None = None
         if transition.to_state == SetupState.TRIGGERED:
             signal = engine.signals[-1]
             repository.save_signal(signal)
@@ -115,14 +125,87 @@ async def run_live(settings: Settings, repository: Repository, manager: Watchlis
                 signal, transition.observation.model_dump(mode="json")
             )
             tracker.open(signal, transition.observation.model_dump(mode="json"))
-        await alerts.send(transition)
+            if provider is not None:
+                try:
+                    chain = await provider.get_option_chain(signal.symbol)
+                    candidates = [
+                        OptionCandidate(
+                            **quote.model_dump(exclude={"timestamp"}),
+                            quote_timestamp=quote.timestamp,
+                        )
+                        for quote in chain
+                    ]
+                    option = select_option(
+                        candidates, signal.price, signal.direction, settings.options
+                    )
+                    if option is not None:
+                        option_record = option_tracker.open(
+                            trade_ids[signal.symbol], signal, option
+                        )
+                        option_record.option_trade_id = repository.save_option_trade(
+                            option_record,
+                            {
+                                **option.model_dump(mode="json"),
+                                "execution_policy_version": (
+                                    settings.options.execution_policy_version
+                                ),
+                            },
+                        )
+                        repository.application_event(
+                            option_record.opened_at,
+                            "shadow_option_opened",
+                            "one-contract option shadow trade opened at displayed ask",
+                            {
+                                "underlying": signal.symbol,
+                                "option_symbol": option.symbol,
+                                "entry_fill": option_record.entry_fill,
+                                "quantity": option_record.quantity,
+                                "execution_policy_version": (
+                                    option_record.execution_policy_version
+                                ),
+                            },
+                        )
+                    else:
+                        repository.application_event(
+                            signal.timestamp,
+                            "option_selection_unavailable",
+                            "no option contract passed the deterministic liquidity/delta rules",
+                            {"underlying": signal.symbol},
+                        )
+                except Exception as exc:
+                    logging.getLogger("tradingpilot.options").warning(
+                        "option_selection_failed",
+                        extra={
+                            "event": "option_selection_failed",
+                            "symbol": signal.symbol,
+                            "state": type(exc).__name__,
+                        },
+                    )
+        await alerts.send(transition, option)
 
     async def completed_candle(candle) -> None:
         nonlocal last_health_recorded
-        trade = tracker.update(candle.symbol, candle.timestamp, candle.close)
+        trade = tracker.update_candle(candle)
         trade_id = trade_ids.get(candle.symbol)
         if trade and trade_id:
             repository.save_outcome(trade_id, candle.timestamp, outcome_summary(trade))
+            option_trade = option_tracker.active.get(candle.symbol)
+            if provider is not None and option_trade is not None:
+                try:
+                    quote = await provider.get_option_quote(option_trade.option_symbol)
+                    if quote is not None:
+                        payload = option_tracker.update(candle, quote, trade)
+                        if payload is not None and option_trade.option_trade_id is not None:
+                            repository.save_option_mark(
+                                option_trade.option_trade_id, quote.timestamp, payload
+                            )
+                except Exception:
+                    logging.getLogger("tradingpilot.options").exception(
+                        "option_mark_failed",
+                        extra={"event": "option_mark_failed", "symbol": candle.symbol},
+                    )
+            if trade.tracking_complete:
+                tracker.active.pop(candle.symbol, None)
         if (
             last_health_recorded is None
             or (candle.timestamp - last_health_recorded).total_seconds() >= 30
@@ -131,7 +214,11 @@ async def run_live(settings: Settings, repository: Repository, manager: Watchlis
                 candle.timestamp,
                 "market_data_heartbeat",
                 "normalized market data received",
-                {"connection_state": provider.connection_state.value},
+                {
+                    "connection_state": (
+                        provider.connection_state.value if provider is not None else "UNKNOWN"
+                    )
+                },
             )
             last_health_recorded = candle.timestamp
 
@@ -139,13 +226,26 @@ async def run_live(settings: Settings, repository: Repository, manager: Watchlis
         repository.save_feature_snapshot(payload)
 
     engine = StrategyEngine(settings.strategy, transition_handler)
+    session_start = datetime.combine(
+        datetime.now(settings.tz).date(), time.min, tzinfo=settings.tz
+    ).astimezone(UTC)
+    engine.restore(
+        repository.load_latest_transitions_since(session_start, settings.strategy.version)
+    )
+    for trade_id, record in repository.load_active_shadow_trades(session_start):
+        tracker.active[record.symbol] = record
+        trade_ids[record.symbol] = trade_id
+    for option_record in repository.load_active_option_trades():
+        option_tracker.restore(option_record)
     coordinator = LiveStrategyCoordinator(engine, settings.strategy)
     auth = token_manager_from_settings(settings)
     logging.getLogger("tradingpilot").info("startup", extra={"event": "startup"})
     repository.application_event(datetime.now(settings.tz), "startup", "TradingPilot started")
     try:
         while True:
-            provider = TastytradeMarketDataProvider(auth, settings.strategy.stale_after_seconds)
+            provider = TastytradeMarketDataProvider(
+                auth, settings.strategy.stale_after_seconds, settings.options
+            )
             monitor = MarketMonitor(
                 provider,
                 settings.strategy.stale_after_seconds,
@@ -239,6 +339,8 @@ def main(argv: list[str] | None = None) -> int:
         print("Watchlist:", " ".join(symbols))
     elif args.command == "status":
         print(json.dumps(repository.status(), indent=2, default=str))
+    elif args.command == "trades":
+        print(format_trade_report(repository.recent_trade_report(args.limit)))
     elif args.command == "init-db":
         print("SQLite schema initialized.")
     return 0

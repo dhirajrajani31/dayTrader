@@ -68,3 +68,14 @@ class StrategyEngine:
             f"{symbol}:{direction.value}": machine.state.value
             for (symbol, direction), machine in self.machines.items()
         }
+
+    def restore(self, transitions: list[StateTransition]) -> None:
+        """Restore today's latest deterministic state without replaying alerts."""
+        for transition in transitions:
+            key = (transition.symbol, transition.direction)
+            machine = StrategyStateMachine(transition.symbol, transition.direction, self.settings)
+            machine.state = transition.to_state
+            if transition.to_state != SetupState.WATCHING:
+                machine.active_level = transition.observation.level
+            machine.transitions.append(transition)
+            self.machines[key] = machine

@@ -1,13 +1,17 @@
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import UTC, datetime
 
 from sqlalchemy import select
 from sqlalchemy.orm import Session, sessionmaker
 
+from app.shadow.option_tracker import ShadowOptionTradeRecord
+from app.shadow.tracker import ShadowTradeRecord
 from app.storage.models import (
     ApplicationEventRow,
     MarketFeatureSnapshotRow,
+    ShadowOptionMarkRow,
+    ShadowOptionTradeRow,
     ShadowTradeOutcomeRow,
     ShadowTradeRow,
     SignalRow,
@@ -15,7 +19,7 @@ from app.storage.models import (
     StrategyStateRow,
     WatchlistSessionRow,
 )
-from app.strategy.models import Signal, StateTransition
+from app.strategy.models import Direction, Signal, StateTransition, StrategyObservation
 
 
 class Repository:
@@ -118,6 +122,222 @@ class Repository:
                 )
             )
 
+    def save_option_trade(self, record: ShadowOptionTradeRecord, selection_payload: dict) -> int:
+        with self.sessions.begin() as db:
+            row = ShadowOptionTradeRow(
+                shadow_trade_id=record.shadow_trade_id,
+                underlying_symbol=record.underlying_symbol,
+                direction=record.direction.value,
+                signal_at=record.signal_at,
+                option_symbol=record.option_symbol,
+                streamer_symbol=record.streamer_symbol,
+                expiration=record.expiration,
+                days_to_expiration=record.days_to_expiration,
+                strike=record.strike,
+                call_put=record.call_put,
+                quantity=record.quantity,
+                multiplier=record.multiplier,
+                opened_at=record.opened_at,
+                entry_bid=record.entry_bid,
+                entry_ask=record.entry_ask,
+                entry_mid=record.entry_mid,
+                entry_fill=record.entry_fill,
+                entry_delta=record.entry_delta,
+                entry_gamma=record.entry_gamma,
+                entry_theta=record.entry_theta,
+                entry_iv=record.entry_iv,
+                entry_open_interest=record.entry_open_interest,
+                entry_volume=record.entry_volume,
+                status=record.status,
+                selection_payload=selection_payload,
+            )
+            db.add(row)
+            db.flush()
+            return row.id
+
+    def save_option_mark(
+        self, option_trade_id: int, timestamp: datetime, payload: dict[str, object]
+    ) -> None:
+        with self.sessions.begin() as db:
+            db.add(
+                ShadowOptionMarkRow(
+                    shadow_option_trade_id=option_trade_id,
+                    timestamp=timestamp,
+                    underlying_price=_required_float(payload["underlying_price"]),
+                    option_bid=_optional_float(payload.get("option_bid")),
+                    option_ask=_optional_float(payload.get("option_ask")),
+                    option_mid=_optional_float(payload.get("option_mid")),
+                    liquidation_price=_optional_float(payload.get("liquidation_price")),
+                    unrealized_pnl=_optional_float(payload.get("unrealized_pnl")),
+                    unrealized_return_pct=_optional_float(payload.get("unrealized_return_pct")),
+                    payload=payload,
+                )
+            )
+            row = db.get(ShadowOptionTradeRow, option_trade_id)
+            if row is not None and payload.get("status") == "CLOSED":
+                row.status = "CLOSED"
+                row.closed_at = _optional_datetime(payload.get("closed_at"))
+                row.exit_reason = str(payload.get("exit_reason") or "UNKNOWN")
+                row.exit_fill = _optional_float(payload.get("exit_fill"))
+                row.realized_pnl = _optional_float(payload.get("realized_pnl"))
+                row.realized_return_pct = _optional_float(payload.get("realized_return_pct"))
+
+    def load_active_shadow_trades(
+        self, opened_since: datetime
+    ) -> list[tuple[int, ShadowTradeRecord]]:
+        with self.sessions() as db:
+            trades = db.scalars(
+                select(ShadowTradeRow).where(ShadowTradeRow.opened_at >= opened_since)
+            ).all()
+            outcomes = db.scalars(
+                select(ShadowTradeOutcomeRow).order_by(ShadowTradeOutcomeRow.id)
+            ).all()
+            latest = {row.shadow_trade_id: row.payload for row in outcomes}
+            restored: list[tuple[int, ShadowTradeRecord]] = []
+            for row in trades:
+                payload = latest.get(row.id, {})
+                if payload.get("tracking_complete"):
+                    continue
+                record = ShadowTradeRecord(
+                    symbol=row.symbol,
+                    direction=Direction(row.direction),
+                    opened_at=_aware_utc(row.opened_at),
+                    strategy_name=row.strategy_name,
+                    strategy_version=row.strategy_version,
+                    entry_underlying=row.entry_underlying,
+                    invalidation_underlying=row.invalidation_underlying,
+                    target_1=row.target_1,
+                    target_2=row.target_2,
+                    entry_context=row.entry_context,
+                    prices_after=payload.get("prices_after", {}),
+                    maximum_favorable_excursion=payload.get("mfe", 0),
+                    maximum_adverse_excursion=payload.get("mae", 0),
+                    stop_hit=payload.get("stop_hit", False),
+                    stop_hit_time=_optional_datetime(payload.get("stop_hit_time")),
+                    target_1_hit=payload.get("target_1_hit", False),
+                    target_2_hit=payload.get("target_2_hit", False),
+                    time_to_target_1_seconds=payload.get("time_to_target_1_seconds"),
+                    time_to_target_2_seconds=payload.get("time_to_target_2_seconds"),
+                    tracking_complete=payload.get("tracking_complete", False),
+                )
+                restored.append((row.id, record))
+            return restored
+
+    def load_active_option_trades(self) -> list[ShadowOptionTradeRecord]:
+        with self.sessions() as db:
+            rows = db.scalars(
+                select(ShadowOptionTradeRow).where(ShadowOptionTradeRow.status == "OPEN")
+            ).all()
+            marks = db.scalars(select(ShadowOptionMarkRow).order_by(ShadowOptionMarkRow.id)).all()
+            latest = {row.shadow_option_trade_id: row for row in marks}
+            records: list[ShadowOptionTradeRecord] = []
+            for row in rows:
+                latest_mark = latest.get(row.id)
+                payload = latest_mark.payload if latest_mark else {}
+                record = ShadowOptionTradeRecord(
+                    execution_policy_version=str(
+                        row.selection_payload.get(
+                            "execution_policy_version", "OPTION_SHADOW_V1"
+                        )
+                    ),
+                    option_trade_id=row.id,
+                    shadow_trade_id=row.shadow_trade_id,
+                    underlying_symbol=row.underlying_symbol,
+                    direction=Direction(row.direction),
+                    signal_at=_aware_utc(row.signal_at),
+                    option_symbol=row.option_symbol,
+                    streamer_symbol=row.streamer_symbol,
+                    expiration=_aware_utc(row.expiration),
+                    days_to_expiration=row.days_to_expiration,
+                    strike=row.strike,
+                    call_put=row.call_put,
+                    quantity=row.quantity,
+                    multiplier=row.multiplier,
+                    opened_at=_aware_utc(row.opened_at),
+                    entry_bid=row.entry_bid,
+                    entry_ask=row.entry_ask,
+                    entry_mid=row.entry_mid,
+                    entry_fill=row.entry_fill,
+                    entry_delta=row.entry_delta,
+                    entry_gamma=row.entry_gamma,
+                    entry_theta=row.entry_theta,
+                    entry_iv=row.entry_iv,
+                    entry_open_interest=row.entry_open_interest,
+                    entry_volume=row.entry_volume,
+                    latest_at=_aware_utc(latest_mark.timestamp) if latest_mark else None,
+                    latest_bid=_optional_float(payload.get("option_bid")),
+                    latest_ask=_optional_float(payload.get("option_ask")),
+                    latest_mid=_optional_float(payload.get("option_mid")),
+                    maximum_favorable_pnl=_required_float(payload.get("maximum_favorable_pnl", 0)),
+                    maximum_adverse_pnl=_required_float(payload.get("maximum_adverse_pnl", 0)),
+                    marks_after=payload.get("marks_after", {}),
+                )
+                records.append(record)
+            return records
+
+    def load_latest_transitions_since(
+        self, since: datetime, strategy_version: str
+    ) -> list[StateTransition]:
+        with self.sessions() as db:
+            rows = db.scalars(
+                select(StateTransitionRow)
+                .where(
+                    StateTransitionRow.timestamp >= since,
+                    StateTransitionRow.strategy_version == strategy_version,
+                )
+                .order_by(StateTransitionRow.id)
+            ).all()
+            latest: dict[tuple[str, str], StateTransitionRow] = {
+                (row.symbol, row.direction): row for row in rows
+            }
+            return [
+                StateTransition(
+                    symbol=row.symbol,
+                    timestamp=StrategyObservation.model_validate(row.snapshot).timestamp,
+                    from_state=row.from_state,
+                    to_state=row.to_state,
+                    direction=row.direction,
+                    reason=row.reason,
+                    strategy_name=row.strategy_name,
+                    strategy_version=row.strategy_version,
+                    observation=StrategyObservation.model_validate(row.snapshot),
+                )
+                for row in latest.values()
+            ]
+
+    def recent_trade_report(self, limit: int = 20) -> list[dict[str, object]]:
+        with self.sessions() as db:
+            trades = db.scalars(
+                select(ShadowTradeRow).order_by(ShadowTradeRow.id.desc()).limit(limit)
+            ).all()
+            option_rows = db.scalars(select(ShadowOptionTradeRow)).all()
+            option_by_trade = {row.shadow_trade_id: row for row in option_rows}
+            marks = db.scalars(select(ShadowOptionMarkRow).order_by(ShadowOptionMarkRow.id)).all()
+            latest_marks = {row.shadow_option_trade_id: row for row in marks}
+            outcomes = db.scalars(
+                select(ShadowTradeOutcomeRow).order_by(ShadowTradeOutcomeRow.id)
+            ).all()
+            latest_outcomes = {row.shadow_trade_id: row.payload for row in outcomes}
+            result: list[dict[str, object]] = []
+            for trade in trades:
+                option = option_by_trade.get(trade.id)
+                mark = latest_marks.get(option.id) if option else None
+                result.append(
+                    {
+                        "id": trade.id,
+                        "symbol": trade.symbol,
+                        "direction": trade.direction,
+                        "opened_at": trade.opened_at,
+                        "entry_underlying": trade.entry_underlying,
+                        "invalidation_underlying": trade.invalidation_underlying,
+                        "target_1": trade.target_1,
+                        "target_2": trade.target_2,
+                        "underlying_outcome": latest_outcomes.get(trade.id, {}),
+                        "option": _option_report(option, mark),
+                    }
+                )
+            return result
+
     def application_event(
         self, timestamp: datetime, event_type: str, message: str, payload: dict | None = None
     ) -> None:
@@ -162,3 +382,60 @@ class Repository:
                 "market_data_connection": connection,
                 "connection_status_as_of": latest_event.timestamp if latest_event else None,
             }
+
+
+def _aware_utc(value: datetime) -> datetime:
+    return value.replace(tzinfo=UTC) if value.tzinfo is None else value
+
+
+def _optional_datetime(value: object) -> datetime | None:
+    if isinstance(value, datetime):
+        return _aware_utc(value)
+    if isinstance(value, str) and value:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        return _aware_utc(parsed)
+    return None
+
+
+def _optional_float(value: object) -> float | None:
+    if value is None:
+        return None
+    return _required_float(value)
+
+
+def _required_float(value: object) -> float:
+    if isinstance(value, (int, float, str)):
+        return float(value)
+    raise TypeError(f"expected numeric value, got {type(value).__name__}")
+
+
+def _option_report(
+    option: ShadowOptionTradeRow | None, mark: ShadowOptionMarkRow | None
+) -> dict[str, object] | None:
+    if option is None:
+        return None
+    return {
+        "symbol": option.option_symbol,
+        "expiration": option.expiration,
+        "strike": option.strike,
+        "call_put": option.call_put,
+        "quantity": option.quantity,
+        "entry_fill": option.entry_fill,
+        "entry_bid": option.entry_bid,
+        "entry_ask": option.entry_ask,
+        "entry_delta": option.entry_delta,
+        "entry_gamma": option.entry_gamma,
+        "entry_theta": option.entry_theta,
+        "entry_iv": option.entry_iv,
+        "entry_open_interest": option.entry_open_interest,
+        "entry_volume": option.entry_volume,
+        "execution_policy_version": option.selection_payload.get(
+            "execution_policy_version", "OPTION_SHADOW_V1"
+        ),
+        "status": option.status,
+        "exit_reason": option.exit_reason,
+        "exit_fill": option.exit_fill,
+        "realized_pnl": option.realized_pnl,
+        "realized_return_pct": option.realized_return_pct,
+        "latest_mark": mark.payload if mark else None,
+    }

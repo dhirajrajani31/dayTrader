@@ -66,9 +66,14 @@ class CandleEvent(MarketEvent):
 
 class OptionQuote(BaseModel):
     symbol: str
+    streamer_symbol: str
+    underlying_symbol: str
     expiration: datetime
+    days_to_expiration: int
     strike: float
     call_put: str
+    shares_per_contract: int = 100
+    timestamp: datetime | None = None
     bid: float | None = None
     ask: float | None = None
     delta: float | None = None
@@ -77,3 +82,11 @@ class OptionQuote(BaseModel):
     iv: float | None = None
     open_interest: int | None = None
     volume: int | None = None
+
+    @property
+    def mid(self) -> float | None:
+        return None if self.bid is None or self.ask is None else (self.bid + self.ask) / 2
+
+    @property
+    def spread(self) -> float | None:
+        return None if self.bid is None or self.ask is None else self.ask - self.bid
