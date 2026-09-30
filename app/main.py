@@ -49,11 +49,9 @@ def dependencies(settings: Settings) -> tuple[Repository, WatchlistManager]:
 
 async def demo(settings: Settings, repository: Repository) -> None:
     settings.assert_shadow_mode()
-    alerts = AlertDispatcher(
-        settings.telegram_bot_token,
-        settings.telegram_chat_id,
-        settings.strategy.alert_cooldown_seconds,
-    )
+    # Synthetic replays are a local validation tool. Never forward DEMO symbols to Telegram,
+    # even when live alert credentials are present in the environment.
+    alerts = AlertDispatcher(cooldown_seconds=settings.strategy.alert_cooldown_seconds)
     tracker = ShadowTracker()
 
     async def transition_handler(transition: StateTransition) -> None:

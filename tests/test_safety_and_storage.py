@@ -1,9 +1,12 @@
 import pytest
 from sqlalchemy import inspect
 
+from app.alerts.telegram import AlertDispatcher
 from app.config.settings import Settings
+from app.main import demo
 from app.storage.database import create_database
 from app.storage.models import Base
+from app.storage.repository import Repository
 
 
 def test_non_shadow_mode_refuses_configuration():
@@ -39,3 +42,25 @@ def test_all_required_sqlite_tables_initialize(tmp_path):
         "shadow_trade_outcomes",
         "application_events",
     } <= names
+
+
+@pytest.mark.asyncio
+async def test_demo_never_uses_configured_telegram_credentials(tmp_path, monkeypatch):
+    settings = Settings(
+        telegram_bot_token="configured-secret",
+        telegram_chat_id="configured-chat",
+        database_url=f"sqlite:///{tmp_path / 'demo.db'}",
+    )
+    _, sessions = create_database(settings.database_url)
+    dispatchers: list[tuple[str | None, str | None]] = []
+
+    async def capture_delivery(self, transition, option=None):
+        dispatchers.append((self.token, self.chat_id))
+        return True
+
+    monkeypatch.setattr(AlertDispatcher, "send", capture_delivery)
+
+    await demo(settings, Repository(sessions))
+
+    assert dispatchers
+    assert set(dispatchers) == {(None, None)}
