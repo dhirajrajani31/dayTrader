@@ -1,0 +1,5 @@
+# One uppercase ticker per line. SPY and QQQ are added automatically.
+MSTR
+COIN
+PLTR
+
