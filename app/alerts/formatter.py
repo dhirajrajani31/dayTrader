@@ -24,6 +24,9 @@ def format_transition(transition: StateTransition, option: OptionCandidate | Non
     lines = [title, "", f"Price: ${obs.price:.2f}"]
     if obs.level:
         lines.append(f"Level: ${obs.level.midpoint:.2f} {obs.level.type.lower().replace('_', ' ')}")
+    if obs.planned_targets and obs.level:
+        path = " → ".join(f"${target:g}" for target in obs.planned_targets)
+        lines.append(f"Planned path: ${obs.level.midpoint:g} → {path}")
     if obs.vwap is not None:
         lines.append(f"VWAP: ${obs.vwap:.2f}")
     if obs.relative_volume is not None:

@@ -39,10 +39,26 @@ class StrategyEngine:
         midpoint = obs.level.midpoint if obs.level else obs.price
         buffer = midpoint * self.settings.invalidation_buffer_pct
         invalidation = (
-            midpoint - buffer if obs.direction == Direction.BULLISH else midpoint + buffer
+            (obs.level.zone.low if obs.level else midpoint) - buffer
+            if obs.direction == Direction.BULLISH
+            else (obs.level.zone.high if obs.level else midpoint) + buffer
         )
         risk = abs(obs.price - invalidation)
         sign = 1 if obs.direction == Direction.BULLISH else -1
+        if obs.planned_targets:
+            return Signal(
+                symbol=obs.symbol,
+                timestamp=obs.timestamp,
+                direction=obs.direction,
+                state=SetupState.TRIGGERED,
+                strategy_name=self.settings.name,
+                strategy_version=self.settings.version,
+                price=obs.price,
+                invalidation=invalidation,
+                target_1=obs.planned_targets[0],
+                target_2=(obs.planned_targets[1] if len(obs.planned_targets) > 1 else None),
+                reasons=transition.reason.split("; "),
+            )
         target_1 = obs.price + sign * risk * self.settings.minimum_reward_risk
         two_r = obs.price + sign * risk * 2
         next_level_is_beyond_target_1 = (
@@ -77,5 +93,6 @@ class StrategyEngine:
             machine.state = transition.to_state
             if transition.to_state != SetupState.WATCHING:
                 machine.active_level = transition.observation.level
+                machine.active_planned_targets = list(transition.observation.planned_targets)
             machine.transitions.append(transition)
             self.machines[key] = machine

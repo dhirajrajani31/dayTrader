@@ -149,6 +149,7 @@ class StrategyObservation(BaseModel):
     opening_range_context: bool = False
     reward_risk: float | None = None
     next_level: float | None = None
+    planned_targets: list[float] = Field(default_factory=list, max_length=2)
 
 
 class StateTransition(BaseModel):

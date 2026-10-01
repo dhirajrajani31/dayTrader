@@ -20,7 +20,7 @@ class StrategySettings(BaseSettings):
     )
 
     name: str = "MR_INVESTR_BASELINE"
-    version: str = "0.1.0"
+    version: str = "0.2.0"
     priority_monitoring_start: time = time(8, 35)
     priority_monitoring_end: time = time(10, 30)
     minimum_relative_volume: float = 1.5
@@ -85,6 +85,7 @@ class Settings(BaseSettings):
     timezone: str = "America/Chicago"
     database_url: str = "sqlite:///data/tradingpilot.db"
     watchlist_file: Path = Path("watchlist.txt")
+    watchlist_context_file: Path = Path("watchlist_context.json")
     log_file: Path = Path("logs/tradingpilot.log")
     telegram_bot_token: str | None = None
     telegram_chat_id: str | None = None

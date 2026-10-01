@@ -27,6 +27,7 @@ class JsonFormatter(logging.Formatter):
             "relative_volume",
             "relative_strength",
             "reward_risk",
+            "planned_targets",
             "check_score",
             "check_total",
             "passed_checks",
@@ -85,6 +86,10 @@ class CandidateFormatter(logging.Formatter):
             f"  Confirmed: {self._checks(record, 'passed_checks')}",
             f"  Still missing: {self._checks(record, 'missing_checks')}",
         ]
+        targets = getattr(record, "planned_targets", ())
+        if targets:
+            path = " → ".join(f"${float(target):g}" for target in targets)
+            lines.insert(2, f"  Planned destination: {path}")
         return "\n".join(lines)
 
 

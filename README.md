@@ -5,7 +5,7 @@ watchlist, evaluates deterministic breakout/retest rules, sends state-change ale
 hypothetical outcomes in SQLite. It does **not** submit brokerage orders and contains no order
 submission API.
 
-The current strategy identity is `MR_INVESTR_BASELINE` version `0.1.0`. Historical rows retain
+The current strategy identity is `MR_INVESTR_BASELINE` version `0.2.0`. Historical rows retain
 that identity so later rule versions can coexist.
 
 ## Safety boundary
@@ -138,6 +138,32 @@ python -m app.main watchlist MSTR COIN CRCL PLTR
 Blank lines, comments beginning with `#`, and duplicates are ignored. Symbols are uppercased.
 `SPY` and `QQQ` are always included. A running process detects file changes and reconnects the
 subscription safely.
+
+Optional dated plans live in `watchlist_context.json`. A plan distinguishes a decision level
+from its intended destinations; it does not treat every number as an unrelated entry. For
+example, `228.79 -> 232` means the normal volume-confirmed breakout and retest occurs around
+228.79, after which 232 becomes the first shadow-trade target. Plans apply only on their exact
+`session_date`, expire automatically afterward, and never bypass the existing relative-volume,
+relative-strength, VWAP/opening-range, room, breakout, or retest checks.
+The decision level can be approached from below for a breakout or from above for a bullish
+retest/bounce; once armed, its ordered destinations remain pinned through the setup lifecycle.
+
+Each symbol can have alternative triggers and up to two ordered targets:
+
+```json
+{
+  "session_date": "2026-10-01",
+  "plans": {
+    "NVDA": {
+      "note": "If 228.79 is reached and confirmed, look for continuation to 232.",
+      "triggers": [{"price": 228.79, "targets": [232.0]}]
+    }
+  }
+}
+```
+
+Telegram alerts, candidate logs, and stored entry observations include the planned path. A target
+is an evaluation point for the simulated trade, not a prediction or order instruction.
 
 ## Candidate visibility
 

@@ -13,6 +13,7 @@ from app.strategy.features import build_feature_snapshot, momentum, relative_str
 from app.strategy.levels import nearest_levels, reference_levels, swing_levels
 from app.strategy.models import Direction, Level, SetupState, StrategyObservation
 from app.strategy.rules import candidate_assessment
+from app.watchlist.context import WatchlistContext
 
 
 class CandleBuilder:
@@ -118,9 +119,15 @@ class MarketMonitor:
 class LiveStrategyCoordinator:
     """Turns completed normalized candles into conservative strategy observations."""
 
-    def __init__(self, engine: StrategyEngine, settings: StrategySettings):
+    def __init__(
+        self,
+        engine: StrategyEngine,
+        settings: StrategySettings,
+        watchlist_context: WatchlistContext | None = None,
+    ):
         self.engine = engine
         self.settings = settings
+        self.watchlist_context = watchlist_context
         self.history: dict[str, list[CandleEvent]] = {}
         self.log = logging.getLogger("tradingpilot.strategy.candidates")
         self._candidate_log_state: dict[
@@ -212,10 +219,18 @@ class LiveStrategyCoordinator:
             values["OPENING_RANGE_15_HIGH"] = max(c.high for c in regular[:15])
             values["OPENING_RANGE_15_LOW"] = min(c.low for c in regular[:15])
         active_session = regular or today
-        levels = reference_levels(values, last.timestamp) + swing_levels(active_session[-40:])
+        base_levels = reference_levels(values, last.timestamp) + swing_levels(
+            active_session[-40:]
+        )
+        manual_levels = (
+            self.watchlist_context.levels_for(symbol, last.timestamp, session_date)
+            if self.watchlist_context is not None
+            else []
+        )
+        levels = base_levels + manual_levels
         if not levels:
             return
-        support, resistance = nearest_levels(last.close, levels)
+        support, resistance = nearest_levels(last.close, base_levels)
         last_local = last.timestamp.astimezone(chicago)
         same_minute_history = [
             candle.volume
@@ -254,9 +269,26 @@ class LiveStrategyCoordinator:
             (Direction.BULLISH, resistance),
             (Direction.BEARISH, support),
         ):
+            planned_level = self._nearby_manual_level(
+                symbol, last.close, direction, manual_levels
+            )
+            if planned_level is not None:
+                level = planned_level
             if level is None:
                 continue
-            next_level = self._next_level(level.midpoint, direction, levels)
+            trigger_plan = (
+                self.watchlist_context.trigger_for_level(symbol, level)
+                if self.watchlist_context is not None
+                else None
+            )
+            if trigger_plan is not None and trigger_plan.direction != direction:
+                continue
+            planned_targets = list(trigger_plan.targets) if trigger_plan is not None else []
+            next_level = (
+                planned_targets[0]
+                if planned_targets
+                else self._next_level(level.midpoint, direction, levels)
+            )
             reward_risk = self._reward_risk(last.close, level.midpoint, next_level)
             observation = StrategyObservation(
                 symbol=symbol,
@@ -284,9 +316,29 @@ class LiveStrategyCoordinator:
                 opening_range_context=level.type.startswith("OPENING_RANGE"),
                 reward_risk=reward_risk,
                 next_level=next_level,
+                planned_targets=planned_targets,
             )
             self._log_interesting_candidate(observation)
             await self.engine.evaluate(observation)
+
+    def _nearby_manual_level(
+        self,
+        symbol: str,
+        price: float,
+        direction: Direction,
+        levels: Sequence[Level],
+    ) -> Level | None:
+        if self.watchlist_context is None:
+            return None
+        candidates: list[Level] = []
+        for level in levels:
+            trigger = self.watchlist_context.trigger_for_level(symbol, level)
+            if trigger is None or trigger.direction != direction:
+                continue
+            distance = abs(price - level.midpoint) / level.midpoint
+            if distance <= self.settings.approach_distance_pct:
+                candidates.append(level)
+        return min(candidates, key=lambda level: abs(price - level.midpoint), default=None)
 
     def _log_interesting_candidate(self, observation: StrategyObservation) -> None:
         machine = self.engine.machines.get((observation.symbol, observation.direction))
@@ -324,6 +376,7 @@ class LiveStrategyCoordinator:
                 "relative_volume": observation.relative_volume,
                 "relative_strength": observation.relative_strength,
                 "reward_risk": observation.reward_risk,
+                "planned_targets": observation.planned_targets,
                 "check_score": assessment.score,
                 "check_total": assessment.total,
                 "passed_checks": assessment.passed,

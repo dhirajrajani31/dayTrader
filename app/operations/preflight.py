@@ -14,6 +14,7 @@ from app.options.models import OptionCandidate
 from app.options.selector import select_option
 from app.storage.repository import Repository
 from app.strategy.models import Direction
+from app.watchlist.context import load_watchlist_context
 from app.watchlist.manager import WatchlistManager
 
 
@@ -57,6 +58,33 @@ async def run_market_check(
             f"{len(symbols)} symbols: {', '.join(symbols)}",
         )
     )
+
+    try:
+        context = load_watchlist_context(settings.watchlist_context_file)
+        if context is None:
+            results.append(
+                CheckResult("watchlist context", CheckStatus.WARN, "no context file configured")
+            )
+        else:
+            missing = sorted(set(context.plans) - set(symbols))
+            if missing:
+                results.append(
+                    CheckResult(
+                        "watchlist context",
+                        CheckStatus.FAIL,
+                        f"context symbols missing from watchlist: {', '.join(missing)}",
+                    )
+                )
+            else:
+                results.append(
+                    CheckResult(
+                        "watchlist context",
+                        CheckStatus.PASS,
+                        f"{len(context.plans)} plans for {context.session_date.isoformat()}",
+                    )
+                )
+    except (OSError, ValueError) as exc:
+        results.append(CheckResult("watchlist context", CheckStatus.FAIL, str(exc)))
 
     results.append(await _check_telegram(settings, send_telegram))
     if not settings.has_tastytrade_credentials:

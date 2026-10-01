@@ -1,0 +1,32 @@
+{
+  "session_date": "2026-10-01",
+  "plans": {
+    "NVDA": {
+      "note": "If 228.79 is reached and confirmed, look for continuation to 232.",
+      "triggers": [{"price": 228.79, "targets": [232.0]}]
+    },
+    "BA": {
+      "note": "If 302.30 is reached and confirmed, look for continuation to 319.",
+      "triggers": [{"price": 302.30, "targets": [319.0]}]
+    },
+    "IOVA": {
+      "note": "If 15.30 is reached and confirmed, look for 15.80 and then 17.",
+      "triggers": [{"price": 15.30, "targets": [15.80, 17.0]}]
+    },
+    "SDEV": {
+      "note": "Watch 3.15 or 3.20, then require the normal retest.",
+      "triggers": [
+        {"price": 3.15, "targets": []},
+        {"price": 3.20, "targets": []}
+      ]
+    },
+    "TGE": {
+      "note": "Watch 1.90, then require the normal retest.",
+      "triggers": [{"price": 1.90, "targets": []}]
+    },
+    "GOW": {
+      "note": "If 3.47 is reached and confirmed, look for 5 and then 6.",
+      "triggers": [{"price": 3.47, "targets": [5.0, 6.0]}]
+    }
+  }
+}

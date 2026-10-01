@@ -24,6 +24,7 @@ from app.storage.repository import Repository
 from app.strategy.engine import StrategyEngine
 from app.strategy.models import Direction, SetupState, StateTransition
 from app.strategy.scenarios import scenario
+from app.watchlist.context import load_watchlist_context
 from app.watchlist.manager import WatchlistManager
 
 
@@ -102,6 +103,7 @@ async def run_live(settings: Settings, repository: Repository, manager: Watchlis
             "tastytrade OAuth credentials are required for run; use 'demo' without credentials"
         )
     symbols = manager.load()
+    watchlist_context = load_watchlist_context(settings.watchlist_context_file)
     repository.save_watchlist(symbols, datetime.now(settings.tz), "file")
     alerts = AlertDispatcher(
         settings.telegram_bot_token,
@@ -237,10 +239,17 @@ async def run_live(settings: Settings, repository: Repository, manager: Watchlis
         trade_ids[record.symbol] = trade_id
     for option_record in repository.load_active_option_trades():
         option_tracker.restore(option_record)
-    coordinator = LiveStrategyCoordinator(engine, settings.strategy)
+    coordinator = LiveStrategyCoordinator(engine, settings.strategy, watchlist_context)
     auth = token_manager_from_settings(settings)
     logging.getLogger("tradingpilot").info("startup", extra={"event": "startup"})
     repository.application_event(datetime.now(settings.tz), "startup", "TradingPilot started")
+    if watchlist_context is not None:
+        repository.application_event(
+            datetime.now(settings.tz),
+            "watchlist_context_loaded",
+            "dated manual decision levels loaded",
+            watchlist_context.model_dump(mode="json"),
+        )
     try:
         while True:
             provider = TastytradeMarketDataProvider(

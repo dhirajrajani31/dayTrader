@@ -38,5 +38,5 @@ async def test_transition_reasons_and_strategy_version_are_preserved():
             transitions.append(transition)
     assert all(item.reason for item in transitions)
     assert all(item.strategy_name == "MR_INVESTR_BASELINE" for item in transitions)
-    assert all(item.strategy_version == "0.1.0" for item in transitions)
-    assert engine.signals[0].strategy_version == "0.1.0"
+    assert all(item.strategy_version == "0.2.0" for item in transitions)
+    assert engine.signals[0].strategy_version == "0.2.0"

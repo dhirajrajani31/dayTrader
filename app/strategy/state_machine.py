@@ -12,13 +12,19 @@ class StrategyStateMachine:
         self.settings = settings or StrategySettings()
         self.state = SetupState.WATCHING
         self.active_level: Level | None = None
+        self.active_planned_targets: list[float] = []
         self.transitions: list[StateTransition] = []
 
     def evaluate(self, observation: StrategyObservation) -> StateTransition | None:
         if observation.symbol != self.symbol or observation.direction != self.direction:
             raise ValueError("observation does not match state machine")
         if self.state != SetupState.WATCHING and self.active_level is not None:
-            observation = observation.model_copy(update={"level": self.active_level})
+            observation = observation.model_copy(
+                update={
+                    "level": self.active_level,
+                    "planned_targets": self.active_planned_targets,
+                }
+            )
         target: SetupState | None = None
         reason = ""
         if self.state == SetupState.WATCHING:
@@ -51,6 +57,7 @@ class StrategyStateMachine:
             return None
         if target == SetupState.ARMED:
             self.active_level = observation.level
+            self.active_planned_targets = list(observation.planned_targets)
         transition = StateTransition(
             symbol=self.symbol,
             timestamp=observation.timestamp,
