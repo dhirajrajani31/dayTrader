@@ -67,11 +67,12 @@ def test_candidate_formatter_is_readable_for_an_operator():
 
     message = CandidateFormatter().format(record)
 
-    assert "COIN | Bearish candidate | 3/5 checks" in message
+    assert "COIN | Bearish watch only | 3/5 checks" in message
     assert "Price $187.50 | Swing Low $187.34 | 0.09% from level" in message
     assert "RVOL 1.30x | Relative strength -4.68% | Reward/risk 0.32" in message
     assert "Confirmed: near the level; directional relative strength" in message
     assert "Still missing: unusual volume; adequate reward/risk" in message
+    assert "Status: WATCH ONLY - NOT ARMED" in message
 
 
 def test_configured_candidate_feed_is_separate_from_json_log(tmp_path):

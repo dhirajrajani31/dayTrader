@@ -24,3 +24,17 @@ def test_interesting_candidate_log_is_structured_and_throttled(caplog):
     assert record.check_score == 5
     assert record.check_total == 5
     assert record.missing_checks == ()
+
+
+def test_counter_direction_candidate_is_not_logged(caplog):
+    settings = StrategySettings(candidate_log_cooldown_seconds=300)
+    coordinator = LiveStrategyCoordinator(StrategyEngine(settings), settings)
+    observation = scenario("triggered", Direction.BULLISH, "WATCH")[0].model_copy(
+        update={"direction": Direction.BEARISH}
+    )
+    caplog.set_level(logging.INFO, logger="tradingpilot.strategy.candidates")
+
+    coordinator._log_interesting_candidate(observation)
+
+    records = [record for record in caplog.records if record.event == "interesting_candidate"]
+    assert records == []

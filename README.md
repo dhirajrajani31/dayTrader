@@ -168,11 +168,13 @@ is an evaluation point for the simulated trade, not a prediction or order instru
 ## Candidate visibility
 
 Telegram is reserved for strategy state transitions such as `ARMED`, `WAITING FOR RETEST`, and
-`TRIGGERED`. The local JSON log also emits an `interesting_candidate` event before a transition
-when a symbol is near an important level and passes at least three of the five arming checks. Each
-event includes direction, price, level, distance, relative volume, relative strength, reward/risk,
-and the passed and missing checks. An unchanged candidate is logged at most once every five
-minutes; a changed level or confirmation set is logged immediately.
+`TRIGGERED`. The local candidate feed emits an `interesting_candidate` event before a transition
+when a symbol is near an important level, its directional relative strength and VWAP/opening-range
+context agree with the displayed direction, and it passes at least three of the five arming checks.
+Each event includes direction, price, level, distance, relative volume, relative strength,
+reward/risk, and the passed and missing checks. Incomplete observations are explicitly labeled
+`WATCH ONLY - NOT ARMED`. An unchanged candidate is logged at most once every five minutes; a
+changed level or confirmation set is logged immediately.
 
 Candidate events are written as readable five-line summaries to `logs/candidates.log` and printed
 in the same format in the running console. Watch them live in a second PowerShell window:

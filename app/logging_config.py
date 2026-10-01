@@ -68,10 +68,11 @@ class CandidateFormatter(logging.Formatter):
         level_type = str(getattr(record, "level_type", "level")).replace("_", " ").title()
         score = getattr(record, "check_score", "?")
         total = getattr(record, "check_total", "?")
+        label = "candidate" if score == total else "watch only"
         lines = [
             (
                 f"[{self.formatTime(record, '%Y-%m-%d %H:%M:%S %z')}] "
-                f"{getattr(record, 'symbol', '?')} | {direction} candidate | {score}/{total} checks"
+                f"{getattr(record, 'symbol', '?')} | {direction} {label} | {score}/{total} checks"
             ),
             (
                 f"  Price ${self._number(record, 'price', '.2f')} | "
@@ -86,6 +87,8 @@ class CandidateFormatter(logging.Formatter):
             f"  Confirmed: {self._checks(record, 'passed_checks')}",
             f"  Still missing: {self._checks(record, 'missing_checks')}",
         ]
+        if score != total:
+            lines.append("  Status: WATCH ONLY - NOT ARMED")
         targets = getattr(record, "planned_targets", ())
         if targets:
             path = " → ".join(f"${float(target):g}" for target in targets)

@@ -59,8 +59,15 @@ def candidate_assessment(obs: StrategyObservation, cfg: StrategySettings) -> Can
     passed = tuple(name for name, result in checks.items() if result)
     missing = tuple(name for name, result in checks.items() if not result)
     near_level = checks["important level approached"]
+    direction_agrees = checks["directional relative strength"]
+    context_agrees = checks["VWAP/opening-range context"]
     return CandidateAssessment(
-        interesting=near_level and len(passed) >= cfg.candidate_log_minimum_checks,
+        interesting=(
+            near_level
+            and direction_agrees
+            and context_agrees
+            and len(passed) >= cfg.candidate_log_minimum_checks
+        ),
         score=len(passed),
         total=len(checks),
         passed=passed,

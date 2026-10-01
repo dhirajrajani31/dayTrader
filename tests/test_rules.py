@@ -38,16 +38,25 @@ async def test_breakout_without_retest_stays_waiting():
     assert not engine.signals
 
 
-def test_interesting_candidate_requires_near_level_and_three_checks():
+def test_interesting_candidate_requires_direction_and_context_alignment():
     settings = StrategySettings()
     observation = scenario("triggered", Direction.BULLISH)[0].model_copy(
-        update={"relative_strength": None, "reward_risk": None}
+        update={"relative_volume": 1.0, "reward_risk": None}
     )
     assessment = candidate_assessment(observation, settings)
     assert assessment.interesting
     assert assessment.score == 3
     assert "important level approached" in assessment.passed
-    assert "directional relative strength" in assessment.missing
+    assert "abnormal activity" in assessment.missing
+
+    contradictory = scenario("triggered", Direction.BULLISH)[0].model_copy(
+        update={"direction": Direction.BEARISH, "opening_range_context": False}
+    )
+    contradictory_assessment = candidate_assessment(contradictory, settings)
+    assert contradictory_assessment.score == 3
+    assert "directional relative strength" in contradictory_assessment.missing
+    assert "VWAP/opening-range context" in contradictory_assessment.missing
+    assert not contradictory_assessment.interesting
 
     far_from_level = observation.model_copy(update={"price": 105.0, "reward_risk": 2.0})
     far_assessment = candidate_assessment(far_from_level, settings)
