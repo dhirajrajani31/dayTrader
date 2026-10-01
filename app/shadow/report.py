@@ -83,18 +83,24 @@ def format_trade_report(rows: list[dict[str, object]]) -> str:
                     ),
                     (
                         f"  Latest liquidation: {_money(latest.get('liquidation_price'))} | "
-                        f"P&L {_money(latest.get('unrealized_pnl'))} "
-                        f"({_percent(latest.get('unrealized_return_pct'))})"
+                        f"net P&L {_money(latest.get('net_unrealized_pnl'))} "
+                        f"({_percent(latest.get('net_unrealized_return_pct'))}) | "
+                        f"gross {_money(latest.get('unrealized_pnl'))}"
                     ),
                     (
                         f"  Status: {option['status']}"
                         + (
                             f" | {option.get('exit_reason')} | realized "
-                            f"{_money(option.get('realized_pnl'))} "
-                            f"({_percent(option.get('realized_return_pct'))})"
+                            f"net {_money(latest.get('net_realized_pnl'))} "
+                            f"({_percent(latest.get('net_realized_return_pct'))}) | "
+                            f"gross {_money(option.get('realized_pnl'))}"
                             if option.get("status") == "CLOSED"
                             else ""
                         )
+                    ),
+                    (
+                        "  Estimated round-trip friction: "
+                        f"{_money(latest.get('estimated_round_trip_cost'))}"
                     ),
                     f"  Execution policy: {option['execution_policy_version']}",
                 ]

@@ -52,6 +52,7 @@ def test_all_required_sqlite_tables_initialize(tmp_path):
         "shadow_trade_outcomes",
         "shadow_option_trades",
         "shadow_option_marks",
+        "shadow_execution_events",
         "application_events",
     } <= names
 

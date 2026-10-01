@@ -4,7 +4,7 @@ import argparse
 import asyncio
 import json
 import logging
-from datetime import UTC, datetime, time, timedelta
+from datetime import UTC, date, datetime, time, timedelta
 
 from app.alerts.telegram import AlertDispatcher
 from app.config.settings import Settings
@@ -18,6 +18,7 @@ from app.runtime import LiveStrategyCoordinator, MarketMonitor
 from app.shadow.option_tracker import OptionShadowTracker
 from app.shadow.outcome_engine import outcome_summary
 from app.shadow.report import format_trade_report
+from app.shadow.scorecard import build_scorecards, default_start, format_scorecards
 from app.shadow.tracker import ShadowTracker
 from app.storage.database import create_database
 from app.storage.repository import Repository
@@ -45,6 +46,13 @@ def parser() -> argparse.ArgumentParser:
     commands.add_parser("status", help="print persisted local status")
     trades = commands.add_parser("trades", help="print recent shadow trade outcomes")
     trades.add_argument("--limit", type=int, default=20)
+    scorecard = commands.add_parser(
+        "scorecard", help="print daily trigger, execution, and net-P&L evaluation"
+    )
+    period = scorecard.add_mutually_exclusive_group()
+    period.add_argument("--date", help="Chicago trading date in YYYY-MM-DD format")
+    period.add_argument("--all", action="store_true", dest="all_history")
+    scorecard.add_argument("--days", type=int, default=1)
     commands.add_parser("init-db", help="initialize the SQLite schema")
     return root
 
@@ -153,6 +161,31 @@ async def run_live(settings: Settings, repository: Repository, manager: Watchlis
                                 ),
                             },
                         )
+                        intended_at = signal.timestamp + timedelta(minutes=1)
+                        entry_delay = max(
+                            (option_record.opened_at - intended_at).total_seconds(), 0
+                        )
+                        entry_status = (
+                            "DELAYED"
+                            if entry_delay
+                            > settings.options.execution_delay_tolerance_seconds
+                            else "SUCCESS"
+                        )
+                        repository.save_execution_event(
+                            symbol=signal.symbol,
+                            timestamp=option_record.opened_at,
+                            stage="ENTRY",
+                            status=entry_status,
+                            reason_code=(
+                                "LATE_OPTION_SNAPSHOT"
+                                if entry_status == "DELAYED"
+                                else "VALID_OPTION_SNAPSHOT"
+                            ),
+                            shadow_trade_id=trade_ids[signal.symbol],
+                            shadow_option_trade_id=option_record.option_trade_id,
+                            intended_at=intended_at,
+                            delay_seconds=entry_delay,
+                        )
                         repository.application_event(
                             option_record.opened_at,
                             "shadow_option_opened",
@@ -168,6 +201,15 @@ async def run_live(settings: Settings, repository: Repository, manager: Watchlis
                             },
                         )
                     else:
+                        repository.save_execution_event(
+                            symbol=signal.symbol,
+                            timestamp=datetime.now(UTC),
+                            stage="ENTRY",
+                            status="MISSED",
+                            reason_code="NO_CONTRACT_PASSED_FILTERS",
+                            shadow_trade_id=trade_ids[signal.symbol],
+                            intended_at=signal.timestamp + timedelta(minutes=1),
+                        )
                         repository.application_event(
                             signal.timestamp,
                             "option_selection_unavailable",
@@ -175,6 +217,16 @@ async def run_live(settings: Settings, repository: Repository, manager: Watchlis
                             {"underlying": signal.symbol},
                         )
                 except Exception as exc:
+                    repository.save_execution_event(
+                        symbol=signal.symbol,
+                        timestamp=datetime.now(UTC),
+                        stage="ENTRY",
+                        status="MISSED",
+                        reason_code="OPTION_SELECTION_ERROR",
+                        shadow_trade_id=trade_ids[signal.symbol],
+                        intended_at=signal.timestamp + timedelta(minutes=1),
+                        payload={"error_type": type(exc).__name__},
+                    )
                     logging.getLogger("tradingpilot.options").warning(
                         "option_selection_failed",
                         extra={
@@ -193,20 +245,51 @@ async def run_live(settings: Settings, repository: Repository, manager: Watchlis
             repository.save_outcome(trade_id, candle.timestamp, outcome_summary(trade))
             option_trade = option_tracker.active.get(candle.symbol)
             if provider is not None and option_trade is not None:
+                quote = None
                 try:
                     quote = await provider.get_option_quote(option_trade.option_symbol)
-                    if quote is not None:
-                        payload = option_tracker.update(candle, quote, trade)
-                        if payload is not None and option_trade.option_trade_id is not None:
-                            repository.save_option_mark(
-                                option_trade.option_trade_id, quote.timestamp, payload
-                            )
                 except Exception:
                     logging.getLogger("tradingpilot.options").exception(
                         "option_mark_failed",
                         extra={"event": "option_mark_failed", "symbol": candle.symbol},
                     )
-            if trade.tracking_complete:
+                payload = option_tracker.update(candle, quote, trade)
+                if payload is not None and option_trade.option_trade_id is not None:
+                    mark_at = (
+                        quote.timestamp
+                        if quote is not None
+                        else candle.timestamp + timedelta(seconds=candle.interval_seconds)
+                    )
+                    repository.save_option_mark(
+                        option_trade.option_trade_id, mark_at, payload
+                    )
+                    event = payload.get("execution_event")
+                    if isinstance(event, dict):
+                        intended_at_value = event.get("intended_at")
+                        intended_at = (
+                            datetime.fromisoformat(intended_at_value)
+                            if isinstance(intended_at_value, str)
+                            else None
+                        )
+                        repository.save_execution_event(
+                            symbol=candle.symbol,
+                            timestamp=mark_at,
+                            stage=str(event.get("stage", "EXIT")),
+                            status=str(event.get("status", "UNKNOWN")),
+                            reason_code=str(event.get("reason_code", "UNKNOWN")),
+                            shadow_trade_id=option_trade.shadow_trade_id,
+                            shadow_option_trade_id=option_trade.option_trade_id,
+                            intended_at=intended_at,
+                            delay_seconds=(
+                                float(event["delay_seconds"])
+                                if isinstance(event.get("delay_seconds"), (int, float))
+                                else None
+                            ),
+                        )
+            # Keep the underlying record alive past 60 minutes only when an option exit is
+            # pending a valid quote. Otherwise a missing quote on the time-exit candle could
+            # strand the simulated position permanently.
+            if trade.tracking_complete and candle.symbol not in option_tracker.active:
                 tracker.active.pop(candle.symbol, None)
         if (
             last_health_recorded is None
@@ -350,6 +433,15 @@ def main(argv: list[str] | None = None) -> int:
         print(json.dumps(repository.status(), indent=2, default=str))
     elif args.command == "trades":
         print(format_trade_report(repository.recent_trade_report(args.limit)))
+    elif args.command == "scorecard":
+        today = datetime.now(settings.tz).date()
+        selected_date = date.fromisoformat(args.date) if args.date else None
+        start = None if args.all_history else selected_date or default_start(today, args.days)
+        end = None if args.all_history else selected_date or today
+        cards = build_scorecards(
+            repository.evaluation_dataset(), settings.tz, start=start, end=end
+        )
+        print(format_scorecards(cards))
     elif args.command == "init-db":
         print("SQLite schema initialized.")
     return 0

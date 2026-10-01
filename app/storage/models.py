@@ -161,6 +161,25 @@ class ShadowOptionMarkRow(Base):
     payload: Mapped[dict] = mapped_column(JSON)
 
 
+class ShadowExecutionEventRow(Base):
+    __tablename__ = "shadow_execution_events"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    shadow_trade_id: Mapped[int | None] = mapped_column(
+        ForeignKey("shadow_trades.id"), index=True
+    )
+    shadow_option_trade_id: Mapped[int | None] = mapped_column(
+        ForeignKey("shadow_option_trades.id"), index=True
+    )
+    symbol: Mapped[str] = mapped_column(String(16), index=True)
+    timestamp: Mapped[datetime] = mapped_column(UTCDateTime(), index=True)
+    stage: Mapped[str] = mapped_column(String(16), index=True)
+    status: Mapped[str] = mapped_column(String(16), index=True)
+    reason_code: Mapped[str] = mapped_column(String(64), index=True)
+    intended_at: Mapped[datetime | None] = mapped_column(UTCDateTime())
+    delay_seconds: Mapped[float | None] = mapped_column(Float)
+    payload: Mapped[dict] = mapped_column(JSON, default=dict)
+
+
 class ApplicationEventRow(Base):
     __tablename__ = "application_events"
     id: Mapped[int] = mapped_column(primary_key=True)

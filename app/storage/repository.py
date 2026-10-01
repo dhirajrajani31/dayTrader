@@ -10,6 +10,7 @@ from app.shadow.tracker import ShadowTradeRecord
 from app.storage.models import (
     ApplicationEventRow,
     MarketFeatureSnapshotRow,
+    ShadowExecutionEventRow,
     ShadowOptionMarkRow,
     ShadowOptionTradeRow,
     ShadowTradeOutcomeRow,
@@ -149,7 +150,21 @@ class Repository:
                 entry_open_interest=record.entry_open_interest,
                 entry_volume=record.entry_volume,
                 status=record.status,
-                selection_payload=selection_payload,
+                selection_payload={
+                    **selection_payload,
+                    "opening_commission_per_contract": (
+                        record.opening_commission_per_contract
+                    ),
+                    "estimated_opening_fees_per_contract": (
+                        record.estimated_opening_fees_per_contract
+                    ),
+                    "estimated_closing_fees_per_contract": (
+                        record.estimated_closing_fees_per_contract
+                    ),
+                    "additional_slippage_price_per_side": (
+                        record.additional_slippage_price_per_side
+                    ),
+                },
             )
             db.add(row)
             db.flush()
@@ -182,21 +197,58 @@ class Repository:
                 row.realized_pnl = _optional_float(payload.get("realized_pnl"))
                 row.realized_return_pct = _optional_float(payload.get("realized_return_pct"))
 
+    def save_execution_event(
+        self,
+        *,
+        symbol: str,
+        timestamp: datetime,
+        stage: str,
+        status: str,
+        reason_code: str,
+        shadow_trade_id: int | None = None,
+        shadow_option_trade_id: int | None = None,
+        intended_at: datetime | None = None,
+        delay_seconds: float | None = None,
+        payload: dict | None = None,
+    ) -> None:
+        with self.sessions.begin() as db:
+            db.add(
+                ShadowExecutionEventRow(
+                    shadow_trade_id=shadow_trade_id,
+                    shadow_option_trade_id=shadow_option_trade_id,
+                    symbol=symbol,
+                    timestamp=timestamp,
+                    stage=stage,
+                    status=status,
+                    reason_code=reason_code,
+                    intended_at=intended_at,
+                    delay_seconds=delay_seconds,
+                    payload=payload or {},
+                )
+            )
+
     def load_active_shadow_trades(
         self, opened_since: datetime
     ) -> list[tuple[int, ShadowTradeRecord]]:
         with self.sessions() as db:
-            trades = db.scalars(
-                select(ShadowTradeRow).where(ShadowTradeRow.opened_at >= opened_since)
-            ).all()
+            trades = db.scalars(select(ShadowTradeRow)).all()
+            open_option_shadow_ids = set(
+                db.scalars(
+                    select(ShadowOptionTradeRow.shadow_trade_id).where(
+                        ShadowOptionTradeRow.status == "OPEN"
+                    )
+                ).all()
+            )
             outcomes = db.scalars(
                 select(ShadowTradeOutcomeRow).order_by(ShadowTradeOutcomeRow.id)
             ).all()
             latest = {row.shadow_trade_id: row.payload for row in outcomes}
             restored: list[tuple[int, ShadowTradeRecord]] = []
             for row in trades:
+                if row.opened_at < opened_since and row.id not in open_option_shadow_ids:
+                    continue
                 payload = latest.get(row.id, {})
-                if payload.get("tracking_complete"):
+                if payload.get("tracking_complete") and row.id not in open_option_shadow_ids:
                     continue
                 record = ShadowTradeRecord(
                     symbol=row.symbol,
@@ -264,13 +316,37 @@ class Repository:
                     entry_iv=row.entry_iv,
                     entry_open_interest=row.entry_open_interest,
                     entry_volume=row.entry_volume,
+                    opening_commission_per_contract=_required_float(
+                        row.selection_payload.get("opening_commission_per_contract", 1.0)
+                    ),
+                    estimated_opening_fees_per_contract=_required_float(
+                        row.selection_payload.get("estimated_opening_fees_per_contract", 0.15)
+                    ),
+                    estimated_closing_fees_per_contract=_required_float(
+                        row.selection_payload.get("estimated_closing_fees_per_contract", 0.15)
+                    ),
+                    additional_slippage_price_per_side=_required_float(
+                        row.selection_payload.get("additional_slippage_price_per_side", 0.01)
+                    ),
                     latest_at=_aware_utc(latest_mark.timestamp) if latest_mark else None,
                     latest_bid=_optional_float(payload.get("option_bid")),
                     latest_ask=_optional_float(payload.get("option_ask")),
                     latest_mid=_optional_float(payload.get("option_mid")),
                     maximum_favorable_pnl=_required_float(payload.get("maximum_favorable_pnl", 0)),
                     maximum_adverse_pnl=_required_float(payload.get("maximum_adverse_pnl", 0)),
+                    maximum_favorable_net_pnl=_required_float(
+                        payload.get("maximum_favorable_net_pnl", 0)
+                    ),
+                    maximum_adverse_net_pnl=_required_float(
+                        payload.get("maximum_adverse_net_pnl", 0)
+                    ),
                     marks_after=payload.get("marks_after", {}),
+                    pending_exit_reason=(
+                        str(payload["pending_exit_reason"])
+                        if payload.get("pending_exit_reason")
+                        else None
+                    ),
+                    pending_exit_at=_optional_datetime(payload.get("pending_exit_at")),
                 )
                 records.append(record)
             return records
@@ -337,6 +413,81 @@ class Repository:
                     }
                 )
             return result
+
+    def evaluation_dataset(self) -> dict[str, list[dict[str, object]]]:
+        """Return normalized rows for deterministic scorecard calculations."""
+        with self.sessions() as db:
+            signals = db.scalars(select(SignalRow).order_by(SignalRow.timestamp)).all()
+            transitions = db.scalars(
+                select(StateTransitionRow).order_by(StateTransitionRow.timestamp)
+            ).all()
+            options = db.scalars(
+                select(ShadowOptionTradeRow).order_by(ShadowOptionTradeRow.signal_at)
+            ).all()
+            marks = db.scalars(
+                select(ShadowOptionMarkRow).order_by(ShadowOptionMarkRow.id)
+            ).all()
+            events = db.scalars(
+                select(ShadowExecutionEventRow).order_by(ShadowExecutionEventRow.timestamp)
+            ).all()
+            latest_marks = {row.shadow_option_trade_id: row for row in marks}
+            return {
+                "signals": [
+                    {
+                        "id": row.id,
+                        "symbol": row.symbol,
+                        "timestamp": row.timestamp,
+                        "direction": row.direction,
+                        "strategy_version": row.strategy_version,
+                    }
+                    for row in signals
+                ],
+                "transitions": [
+                    {
+                        "symbol": row.symbol,
+                        "timestamp": row.timestamp,
+                        "to_state": row.to_state,
+                        "strategy_version": row.strategy_version,
+                    }
+                    for row in transitions
+                ],
+                "option_trades": [
+                    {
+                        "id": row.id,
+                        "shadow_trade_id": row.shadow_trade_id,
+                        "symbol": row.underlying_symbol,
+                        "signal_at": row.signal_at,
+                        "status": row.status,
+                        "exit_reason": row.exit_reason,
+                        "gross_realized_pnl": row.realized_pnl,
+                        "latest_mark": (
+                            latest_marks[row.id].payload if row.id in latest_marks else None
+                        ),
+                    }
+                    for row in options
+                ],
+                "execution_events": [
+                    {
+                        "shadow_trade_id": row.shadow_trade_id,
+                        "shadow_option_trade_id": row.shadow_option_trade_id,
+                        "symbol": row.symbol,
+                        "timestamp": row.timestamp,
+                        "stage": row.stage,
+                        "status": row.status,
+                        "reason_code": row.reason_code,
+                        "delay_seconds": row.delay_seconds,
+                    }
+                    for row in events
+                ],
+                "option_marks": [
+                    {
+                        "shadow_option_trade_id": row.shadow_option_trade_id,
+                        "timestamp": row.timestamp,
+                        "mark_quality": row.payload.get("mark_quality", "UNKNOWN"),
+                    }
+                    for row in marks
+                ],
+            }
 
     def application_event(
         self, timestamp: datetime, event_type: str, message: str, payload: dict | None = None

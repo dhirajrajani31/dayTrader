@@ -58,6 +58,12 @@ class OptionSettings(BaseSettings):
     quantity: int = Field(default=1, ge=1)
     contract_multiplier: int = Field(default=100, ge=1)
     maximum_holding_minutes: int = Field(default=60, ge=5)
+    opening_commission_per_contract: float = Field(default=1.00, ge=0)
+    estimated_opening_fees_per_contract: float = Field(default=0.15, ge=0)
+    estimated_closing_fees_per_contract: float = Field(default=0.15, ge=0)
+    additional_slippage_price_per_side: float = Field(default=0.01, ge=0)
+    execution_delay_tolerance_seconds: int = Field(default=15, ge=0)
+    maximum_option_quote_age_seconds: int = Field(default=30, ge=1)
 
     @field_validator("maximum_abs_delta")
     @classmethod

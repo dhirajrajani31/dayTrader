@@ -269,6 +269,17 @@ closes at bid when the underlying reaches target 1, breaches invalidation, or re
 time limit. If target and stop occur in the same one-minute candle, the conservative stop outcome
 wins. This is execution policy `OPTION_SHADOW_V1`; changing assumptions requires a new version.
 
+Net P&L additionally subtracts the current $1 stock/ETF option opening commission shown on
+[tastytrade's pricing page](https://tastytrade.com/pricing/), configurable estimated opening and
+closing fees, and a configurable one-cent option-price slippage stress on each side. Ancillary
+fees are estimates until reconciled against real brokerage statements; all assumptions are exposed
+as `OPTION_...` settings in `.env.example`.
+
+Entry and exit execution attempts are stored with `SUCCESS`, `DELAYED`, or `MISSED` status and a
+machine-readable reason. A stop, target, or time exit remains pending if its option quote is absent,
+invalid, or stale. The trade closes at the first later valid bid and records the delay instead of
+silently losing the exit event. Pending exits survive process and session-date restarts.
+
 Underlying MFE/MAE, target, and stop detection use each completed candle's high and low—not only
 its close—fixing the prior intraminute blind spot. Exact ordering inside a one-minute candle is not
 available. A restart restores today's state machines and open underlying/option shadow trades from
@@ -284,6 +295,30 @@ The report shows the underlying setup and outcome, exact OCC contract, entry Gre
 liquidity, conservative liquidation value, unrealized/realized P&L, and exit reason. These are
 simulations and never brokerage orders.
 
+## Daily evaluation scorecard
+
+The scorecard groups timestamps by Chicago trading date and reports the complete funnel: armed
+setups, triggers, option trades, closed/open trades, entry coverage, missed or delayed entries,
+wins/losses, gross and net P&L, expectancy, profit factor, maximum drawdown, exit reasons, missed
+or delayed exits, and quote-mark quality.
+
+```powershell
+# Today's scorecard
+python -m app.main scorecard
+
+# A specific Chicago trading date
+python -m app.main scorecard --date 2026-10-01
+
+# Recent period or all recorded history
+python -m app.main scorecard --days 20
+python -m app.main scorecard --all
+```
+
+`CLEAN` means no classified operational failure was observed; it does not mean the strategy is
+profitable. The evidence counter uses 200 closed option trades as the minimum forward-test gate.
+Old triggers created before structured option execution appear as `unclassified` rather than being
+silently treated as missed trades.
+
 Tables are:
 
 - `watchlist_sessions`
@@ -295,6 +330,7 @@ Tables are:
 - `shadow_trade_outcomes`
 - `shadow_option_trades`
 - `shadow_option_marks`
+- `shadow_execution_events`
 - `application_events`
 
 ## Validation
@@ -305,6 +341,7 @@ ruff check .
 mypy app
 python -m app.main demo
 python -m app.main market-check --stream-seconds 15
+python -m app.main scorecard
 ```
 
 ## Known limitations and next phases
@@ -319,7 +356,8 @@ In priority order:
    The current session helper handles
    weekdays, Chicago time, and DST but not exchange holidays.
 4. Add database migrations, retention, and outcome compaction for longer pilot runs.
-5. Add more detailed feed-health metrics.
+5. Forward-score interesting candidates that never trigger to measure strategy-level missed
+   opportunities; current missed-entry metrics cover triggered setups only.
 6. Add verified sector ETF context; no sector mapping is guessed in this version.
 
 Do not treat the current thresholds or synthetic results as evidence of profitability. Run shadow
