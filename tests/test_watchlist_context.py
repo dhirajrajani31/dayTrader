@@ -80,4 +80,4 @@ def test_new_symbols_are_added_without_removing_existing_symbols():
     symbols = WatchlistManager(Path("watchlist.txt")).load()
 
     assert {"MSTR", "COIN", "PLTR", "AAPL", "TSLA", "MU"} <= set(symbols)
-    assert {"NVDA", "BA", "IOVA", "SDEV", "TGE", "GOW"} <= set(symbols)
+    assert {"NVDA", "BE", "IOVA", "SDEV", "TGE", "GOW"} <= set(symbols)

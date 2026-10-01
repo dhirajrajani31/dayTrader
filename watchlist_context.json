@@ -5,7 +5,7 @@
       "note": "If 228.79 is reached and confirmed, look for continuation to 232.",
       "triggers": [{"price": 228.79, "targets": [232.0]}]
     },
-    "BA": {
+    "BE": {
       "note": "If 302.30 is reached and confirmed, look for continuation to 319.",
       "triggers": [{"price": 302.30, "targets": [319.0]}]
     },
